@@ -10,8 +10,3 @@ logs/
 uploads/
 *.jsonl
 *.log
-lc_browser_spark.py
-mcp_server_spark.py
-lc_cli_spark.py
-port_browser.py
-port_mcp.py

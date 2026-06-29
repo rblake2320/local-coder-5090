@@ -1099,6 +1099,36 @@ async def local_coder_semantic_interpret(
         return response.json()
 
 
+async def _run_specialist(specialist_key: str, display_name: str, task: str, context_label: str, context_value: str, truncate: int = 0) -> dict:
+    try:
+        prompt = task
+        if context_value:
+            val = context_value[:truncate] if truncate else context_value
+            prompt = f"{task}\n\n{context_label}:\n{val}"
+        response = await call_model(
+            SPECIALIST_PROMPTS[specialist_key],
+            prompt,
+            max_tokens=3000,
+            specialist=specialist_key,
+        )
+        if not response or response.startswith("[Error"):
+            response = f"I encountered an issue processing your request. Debug info: {response}"
+        return {
+            "specialist": display_name,
+            "response": response,
+            "task": task[:200],
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as exc:
+        return {
+            "specialist": display_name,
+            "response": f"Error processing request: {exc}. Please try again.",
+            "task": task[:200],
+            "timestamp": datetime.now().isoformat(),
+            "error": str(exc),
+        }
+
+
 @app.tool
 async def software_engineer(
     task: Annotated[str, "The coding task, question, or code to review"],
@@ -1108,36 +1138,7 @@ async def software_engineer(
     72B Software Engineer - LIVE INFERENCE.
     Actually processes your request and returns AI-generated code/analysis.
     """
-    try:
-        prompt = f"{task}"
-        if context:
-            prompt = f"{task}\n\nContext: {context}"
-        
-        response = await call_model(
-            SPECIALIST_PROMPTS["software_engineer"],
-            prompt,
-            max_tokens=3000,
-            specialist="software_engineer"
-        )
-        
-        # Ensure we never return an empty or error-only response
-        if not response or response.startswith("[Error"):
-            response = f"I apologize, but I encountered an issue processing your request. Please try again. Debug info: {response}"
-        
-        return {
-            "specialist": "SoftwareEngineer",
-            "response": response,
-            "task": task[:200],
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "specialist": "SoftwareEngineer",
-            "response": f"Error processing request: {str(e)}. Please try again.",
-            "task": task[:200],
-            "timestamp": datetime.now().isoformat(),
-            "error": str(e)
-        }
+    return await _run_specialist("software_engineer", "SoftwareEngineer", task, "Context", context)
 
 
 @app.tool
@@ -1149,23 +1150,7 @@ async def security_analyst(
     72B Security Analyst - LIVE INFERENCE.
     Actually analyzes security concerns and returns findings.
     """
-    prompt = f"{task}"
-    if target:
-        prompt = f"{task}\n\nTarget: {target}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["security_analyst"],
-        prompt,
-        max_tokens=3000,
-        specialist="security_analyst"
-    )
-    
-    return {
-        "specialist": "SecurityAnalyst",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("security_analyst", "SecurityAnalyst", task, "Target", target)
 
 
 @app.tool
@@ -1177,23 +1162,7 @@ async def financial_analyst(
     72B Financial Analyst - LIVE INFERENCE.
     Actually performs financial analysis and returns insights.
     """
-    prompt = f"{task}"
-    if data:
-        prompt = f"{task}\n\nData: {data}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["financial_analyst"],
-        prompt,
-        max_tokens=3000,
-        specialist="financial_analyst"
-    )
-    
-    return {
-        "specialist": "FinancialAnalyst",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("financial_analyst", "FinancialAnalyst", task, "Data", data)
 
 
 @app.tool
@@ -1205,35 +1174,7 @@ async def solutions_architect(
     72B Solutions Architect - LIVE INFERENCE.
     Actually designs systems and returns architecture recommendations.
     """
-    try:
-        prompt = f"{task}"
-        if requirements:
-            prompt = f"{task}\n\nRequirements: {requirements}"
-        
-        response = await call_model(
-            SPECIALIST_PROMPTS["solutions_architect"],
-            prompt,
-            max_tokens=3000,
-            specialist="solutions_architect"
-        )
-        
-        if not response or response.startswith("[Error"):
-            response = f"I apologize, but I encountered an issue processing your request. Please try again. Debug info: {response}"
-        
-        return {
-            "specialist": "SolutionsArchitect",
-            "response": response,
-            "task": task[:200],
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "specialist": "SolutionsArchitect",
-            "response": f"Error processing request: {str(e)}. Please try again.",
-            "task": task[:200],
-            "timestamp": datetime.now().isoformat(),
-            "error": str(e)
-        }
+    return await _run_specialist("solutions_architect", "SolutionsArchitect", task, "Requirements", requirements)
 
 
 @app.tool
@@ -1245,23 +1186,7 @@ async def compliance_officer(
     72B Compliance Officer - LIVE INFERENCE.
     Actually reviews compliance and returns regulatory guidance.
     """
-    prompt = f"{task}"
-    if regulation:
-        prompt = f"{task}\n\nRegulation focus: {regulation}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["compliance_officer"],
-        prompt,
-        max_tokens=3000,
-        specialist="compliance_officer"
-    )
-    
-    return {
-        "specialist": "ComplianceOfficer",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("compliance_officer", "ComplianceOfficer", task, "Regulation focus", regulation)
 
 
 @app.tool
@@ -1273,23 +1198,7 @@ async def contract_analyst(
     Contract Analyst - LIVE INFERENCE.
     Actually reviews contracts and returns legal analysis.
     """
-    prompt = f"{task}"
-    if document:
-        prompt = f"{task}\n\nDocument/Terms:\n{document[:3000]}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["contract_analyst"],
-        prompt,
-        max_tokens=3000,
-        specialist="contract_analyst"
-    )
-    
-    return {
-        "specialist": "ContractAnalyst",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("contract_analyst", "ContractAnalyst", task, "Document/Terms", document, truncate=3000)
 
 
 @app.tool
@@ -1301,23 +1210,7 @@ async def data_engineer(
     Data Engineer - LIVE INFERENCE.
     Actually designs data pipelines and returns implementation.
     """
-    prompt = f"{task}"
-    if data_schema:
-        prompt = f"{task}\n\nSchema:\n{data_schema}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["data_engineer"],
-        prompt,
-        max_tokens=3000,
-        specialist="data_engineer"
-    )
-    
-    return {
-        "specialist": "DataEngineer",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("data_engineer", "DataEngineer", task, "Schema", data_schema)
 
 
 @app.tool
@@ -1329,23 +1222,7 @@ async def devops_engineer(
     DevOps Engineer - LIVE INFERENCE.
     Actually designs infrastructure and returns IaC/configs.
     """
-    prompt = f"{task}"
-    if environment:
-        prompt = f"{task}\n\nEnvironment: {environment}"
-    
-    response = await call_model(
-        SPECIALIST_PROMPTS["devops_engineer"],
-        prompt,
-        max_tokens=3000,
-        specialist="devops_engineer"
-    )
-    
-    return {
-        "specialist": "DevOpsEngineer",
-        "response": response,
-        "task": task[:200],
-        "timestamp": datetime.now().isoformat()
-    }
+    return await _run_specialist("devops_engineer", "DevOpsEngineer", task, "Environment", environment)
 
 
 @app.tool
