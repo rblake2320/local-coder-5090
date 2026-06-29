@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import sys
 import binascii
 import hashlib
 import html
@@ -148,11 +149,12 @@ TEXT_FILE_SUFFIXES = {
 ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
+MAX_REQUEST_BODY = 50 * 1024 * 1024  # 50 MB cap for non-upload POST bodies
 DOCKER_MCP_DEFAULT_ALLOWED = {"mcp-find"}
 DAILY_CONTROL = AI_BUSINESS / "ops" / "daily_control_win.py"
 PROCESS_REGISTRY = AI_BUSINESS / "processes" / "registry.json"
 PROCESS_DOC = AI_BUSINESS / "PROCESS.md"
-MODEL_SERVICE_NAMES = {"OllamaService", "ollama", "LocalCoder"}
+MODEL_SERVICE_NAMES = {"OllamaService", "ollama", "LocalCoder", "qwen3-coder-next-daily"}
 CONTROL_ACTIONS = {
     "status",
     "impact",
@@ -868,9 +870,9 @@ PALETTE_HTML = """<!doctype html>
     <button data-post="/control" data-body='{"action":"model-mode-status"}'>Model Mode</button>
     <button data-post="/control" data-body='{"action":"run-local-coder-tests"}'>Run Tests</button>
     <button data-post="/model/switch" data-body='{"target":"qwen3-coder-next-daily","apply":false}'>Switch Model Dry Run</button>
-    <button data-post="/memory/clean" data-body='{"project_path":"/home/rblake2320/ai-business"}'>Clean Project Memory</button>
+    <button data-post="/memory/clean" data-body='{"project_path":"C:/Users/techai/local-coder"}'>Clean Project Memory</button>
     <button data-post="/route" data-body='{"prompt":"palette route check","context_mode":"fast"}'>Route Check</button>
-    <button data-post="/tools/run" data-body='{"command":"pwd","cwd":"/home/rblake2320/ai-business"}'>Run pwd</button>
+    <button data-post="/tools/run" data-body='{"command":"pwd","cwd":"C:/Users/techai/local-coder"}'>Run pwd</button>
     <button data-post="/upload/file" data-body='{"filename":"palette-note.txt","content":"Palette upload smoke test"}'>Upload Smoke</button>
   </div>
   <pre id="out">Ready.</pre>
@@ -1245,11 +1247,13 @@ def update_project_memory(project_path: str | None, patch: dict[str, Any]) -> di
 
 
 def skill_id_from_path(path: Path) -> str:
-    try:
-        rel = path.parent.relative_to(Path("/home/rblake2320/.codex"))
-        return safe_slug(str(rel))
-    except ValueError:
-        return safe_slug(path.parent.name)
+    for root in SKILL_ROOTS:
+        try:
+            rel = path.parent.relative_to(root)
+            return safe_slug(str(rel))
+        except ValueError:
+            continue
+    return safe_slug(path.parent.name)
 
 
 def parse_skill_frontmatter(text: str) -> dict[str, str]:
@@ -2158,28 +2162,28 @@ def daily_control(action: str) -> dict[str, Any]:
         argv = ["python", str(DAILY_CONTROL), "status"]
         timeout_s = 60
     elif action == "impact":
-        argv = ["python3", str(DAILY_CONTROL), "impact"]
+        argv = [sys.executable, str(DAILY_CONTROL), "impact"]
         timeout_s = 60
     elif action == "model-mode-status":
-        argv = ["python3", str(DAILY_CONTROL), "model-mode", "status"]
+        argv = [sys.executable, str(DAILY_CONTROL), "model-mode", "status"]
         timeout_s = 30
     elif action == "model-mode-on":
-        argv = ["python3", str(DAILY_CONTROL), "model-mode", "on"]
+        argv = [sys.executable, str(DAILY_CONTROL), "model-mode", "on"]
         timeout_s = 120
     elif action == "model-mode-off":
-        argv = ["python3", str(DAILY_CONTROL), "model-mode", "off"]
+        argv = [sys.executable, str(DAILY_CONTROL), "model-mode", "off"]
         timeout_s = 120
     elif action == "start-qwen3-coder-next":
-        argv = ["python3", str(DAILY_CONTROL), "start", "qwen3-coder-next-daily", "--force"]
+        argv = [sys.executable, str(DAILY_CONTROL), "start", "qwen3-coder-next-daily", "--force"]
         timeout_s = 120
     elif action == "stop-qwen3-coder-next-dry-run":
-        argv = ["python3", str(DAILY_CONTROL), "stop", "qwen3-coder-next-daily"]
+        argv = [sys.executable, str(DAILY_CONTROL), "stop", "qwen3-coder-next-daily"]
         timeout_s = 60
     elif action == "stop-qwen3-coder-next-apply":
-        argv = ["python3", str(DAILY_CONTROL), "stop", "qwen3-coder-next-daily", "--apply"]
+        argv = [sys.executable, str(DAILY_CONTROL), "stop", "qwen3-coder-next-daily", "--apply"]
         timeout_s = 120
     elif action == "run-local-coder-tests":
-        argv = ["python3", "-m", "pytest", "tests/ops/test_local_coder_browser.py"]
+        argv = [sys.executable, "-m", "pytest", "tests/ops/test_local_coder_browser.py"]
         timeout_s = 300
     else:
         raise ValueError(f"control action not implemented: {action}")
@@ -2226,19 +2230,20 @@ def switch_model(incoming: dict[str, Any]) -> dict[str, Any]:
             actions.append(
                 run_command_with_trace(
                     f"control_stop_{service}",
-                    ["python3", str(DAILY_CONTROL), "stop", service, "--apply"],
+                    [sys.executable, str(DAILY_CONTROL), "stop", service, "--apply"],
                     timeout_s=120,
                 )
             )
     if target == "qwen3-coder-next-daily":
         actions.append(daily_control("start-qwen3-coder-next"))
     else:
-        result = run_command_with_trace(
-            f"control_start_{target}",
-            ["python3", str(DAILY_CONTROL), "start", target, "--force"],
-            timeout_s=120,
+        actions.append(
+            run_command_with_trace(
+                f"control_start_{target}",
+                [sys.executable, str(DAILY_CONTROL), "start", target, "--force"],
+                timeout_s=120,
+            )
         )
-        actions.append(result)
     failed = [item for item in actions if item.get("returncode") not in (0, None)]
     payload = {"target": target, "apply": True, "status": "failed" if failed else "completed", "actions": actions}
     trace = write_trace("model_switch", payload)
@@ -3485,6 +3490,12 @@ class Handler(BaseHTTPRequestHandler):
         if not _rate_limiter.consume(self.client_address[0]):
             self._send_json(429, {"error": "Rate limit exceeded", "retry_after_seconds": 60})
             return
+        # Cap request body size — upload endpoints are exempt (they check MAX_UPLOAD_BYTES themselves)
+        _upload_paths = {"/upload/file", "/upload/folder"}
+        _content_length = int(self.headers.get("Content-Length", "0"))
+        if self.path not in _upload_paths and _content_length > MAX_REQUEST_BODY:
+            self._send_json(413, {"error": f"Request body too large (max {MAX_REQUEST_BODY // 1024 // 1024} MB)"})
+            return
         if self.path == "/save":
             self.handle_save()
             return
@@ -3583,15 +3594,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
+                collected: list[str] = []
                 try:
                     for chunk in post_model_stream(payload):
                         sse_line = f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
                         self.wfile.write(sse_line.encode("utf-8"))
                         self.wfile.flush()
+                        collected.append(chunk)
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 except (URLError, TimeoutError, OSError):
                     pass
+                finally:
+                    if session_id and collected:
+                        full_reply = "".join(collected)
+                        _session_store.add(
+                            session_id,
+                            list(incoming.get("messages", [])) + [{"role": "assistant", "content": full_reply}],
+                        )
             else:
                 raw = post_model(payload)
                 response = chat_response(raw)
@@ -3975,10 +3995,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _disk_cleanup_loop() -> None:
+    """Background thread: rotate events.jsonl at 50 MB; purge sessions/uploads/patches older than 30 days."""
+    import time as _time
+    TRACE_LOG = TRACE_DIR / "events.jsonl"
+    TRACE_MAX = 50 * 1024 * 1024
+    STALE_DAYS = 30
+    while True:
+        try:
+            _time.sleep(3600)  # run once per hour
+            # Rotate trace log
+            if TRACE_LOG.exists() and TRACE_LOG.stat().st_size > TRACE_MAX:
+                archive = TRACE_LOG.with_suffix(f".{now_stamp()}.jsonl")
+                TRACE_LOG.rename(archive)
+            # Purge stale dirs: sessions, uploads, patches, coding-tasks
+            cutoff = _time.time() - STALE_DAYS * 86400
+            for subdir in ("sessions", "uploads", "patches", "coding-tasks"):
+                target_dir = WORKSPACE / subdir
+                if not target_dir.exists():
+                    continue
+                for item in target_dir.iterdir():
+                    try:
+                        mtime = item.stat().st_mtime
+                        if mtime < cutoff:
+                            if item.is_dir():
+                                shutil.rmtree(item, ignore_errors=True)
+                            else:
+                                item.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        except Exception:
+            pass  # never let cleanup crash the server
+
+
 def main() -> int:
     args = parse_args()
     url = f"http://{args.host}:{args.port}/"
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    cleanup_thread = threading.Thread(target=_disk_cleanup_loop, daemon=True, name="disk-cleanup")
+    cleanup_thread.start()
     print(f"Local coder browser: {url}", flush=True)
     if not args.no_open:
         webbrowser.open(url, new=2)
