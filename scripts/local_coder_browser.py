@@ -157,9 +157,9 @@ CONTROL_ACTIONS = {
     "model-mode-status",
     "model-mode-on",
     "model-mode-off",
-    "start-model",
-    "stop-model-dry-run",
-    "stop-model-apply",
+    "start-qwen3-coder-next",
+    "stop-qwen3-coder-next-dry-run",
+    "stop-qwen3-coder-next-apply",
     "run-local-coder-tests",
 }
 WEB_SEARCH_PROVIDER = os.environ.get("LOCAL_CODER_WEB_SEARCH_PROVIDER", "brave-api,brave-html,duckduckgo-html,bing-html")
@@ -1218,6 +1218,8 @@ def compile_repo_context(project_path: str | None, request: str, mode: str = "fa
     root = Path(project_path).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError(f"project path is not a directory: {root}")
+    # Security: validate root is within an allowed directory
+    _assert_allowed_cwd(str(root))
     mode_config = CONTEXT_MODES.get(mode, CONTEXT_MODES["fast"])
     budget = int(mode_config["context_chars"])
     terms = {term.lower() for term in re.findall(r"[A-Za-z0-9_./-]{3,}", request)}
@@ -1286,30 +1288,64 @@ def compile_repo_context(project_path: str | None, request: str, mode: str = "fa
     }
 
 
+def _assert_allowed_cwd(requested: str | None) -> str:
+    """Resolve path and verify it is within an allowed root."""
+    resolved = Path(requested).expanduser().resolve() if requested else AI_BUSINESS
+    # Build allowed roots from env (semicolon-separated) plus hard defaults
+    env_extra = [
+        Path(p.strip()).expanduser().resolve()
+        for p in os.environ.get("LOCAL_CODER_ALLOWED_ROOTS", "").split(";")
+        if p.strip()
+    ]
+    allowed = [WORKSPACE, AI_BUSINESS, *env_extra]
+    for root in allowed:
+        try:
+            resolved.relative_to(root)
+            return str(resolved)
+        except ValueError:
+            pass
+    raise ValueError(
+        f"cwd '{resolved}' is outside allowed roots. "
+        "Add it to LOCAL_CODER_ALLOWED_ROOTS env var to permit it."
+    )
+
+
 def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None = None, timeout_s: int = 60) -> dict[str, Any]:
     if command not in SAFE_TOOL_COMMANDS:
         raise ValueError(f"tool not allowed: {command}")
     args = args or []
-    workdir = str(Path(cwd).expanduser().resolve()) if cwd else str(AI_BUSINESS)
+    workdir = _assert_allowed_cwd(cwd)
     if command == "pwd":
         cmd = ["pwd"]
     elif command == "ls":
-        cmd = ["ls", "-la", *args[:4]]
+        # Strip flag-like args to prevent ls flag injection
+        safe_args = [a for a in args[:4] if not a.startswith("-")]
+        cmd = ["ls", "-la", *safe_args]
     elif command == "rg":
         if not args:
             raise ValueError("rg requires a search pattern")
-        cmd = ["rg", "--line-number", "--max-count", "20", *args[:6]]
+        # Block flag injection: strip args that look like option flags after the pattern
+        pattern = args[0]
+        safe_extra = [a for a in args[1:6] if not a.startswith("-")]
+        cmd = ["rg", "--line-number", "--max-count", "20", pattern, *safe_extra]
     elif command == "git_status":
         cmd = ["git", "status", "--short"]
     elif command == "git_diff":
         cmd = ["git", "diff", "--", *args[:8]]
     elif command == "pytest":
-        cmd = ["python3", "-m", "pytest", *args[:8]]
+        # Block running pytest from upload directories (RCE via conftest.py)
+        upload_dir = str(UPLOAD_DIR.resolve())
+        if workdir.startswith(upload_dir):
+            raise ValueError("pytest is not allowed to run from upload directories")
+        cmd = ["python", "-m", "pytest", "--no-header", "-p", "no:cacheprovider", *args[:8]]
         timeout_s = min(timeout_s, 300)
     elif command == "py_compile":
         if not args:
             raise ValueError("py_compile requires at least one file")
-        cmd = ["python3", "-m", "py_compile", *args[:12]]
+        cmd = ["python", "-m", "py_compile", *args[:12]]
+    elif command in {"dir", "where"}:
+        safe_args = [a for a in args[:4] if not a.startswith("/") or a.startswith("/b")]
+        cmd = [command, *safe_args]
     else:
         raise ValueError(f"tool not implemented: {command}")
     result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -1439,11 +1475,33 @@ def web_search(incoming: dict[str, Any], timeout_s: int = 20) -> dict[str, Any]:
     return {**payload, "trace": str(trace)}
 
 
+_SSRF_BLOCKED_HOSTS = re.compile(
+    r"^("
+    r"localhost|"
+    r"127\.\d+\.\d+\.\d+|"
+    r"0\.0\.0\.0|"
+    r"::1|"
+    r"\[::1\]|"
+    r"10\.\d+\.\d+\.\d+|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|"
+    r"192\.168\.\d+\.\d+|"
+    r"169\.254\.\d+\.\d+"  # link-local / AWS IMDS
+    r")$",
+    re.IGNORECASE,
+)
+
+
 def web_fetch(incoming: dict[str, Any], timeout_s: int = 20) -> dict[str, Any]:
     url = str(incoming.get("url") or "").strip()
     parsed = urlparse(url)
     if parsed.scheme not in WEB_FETCH_ALLOWED_SCHEMES or not parsed.netloc:
         raise ValueError("web fetch requires an http(s) URL")
+    hostname = parsed.hostname or ""
+    if _SSRF_BLOCKED_HOSTS.match(hostname):
+        raise ValueError(
+            f"web_fetch blocked: '{hostname}' is a private/loopback address. "
+            "Use direct Python calls for localhost services."
+        )
     request = Request(url, headers={"User-Agent": "LocalCoder/1.0"})
     with urlopen(request, timeout=timeout_s) as response:
         content_type = response.headers.get("content-type", "")
@@ -2012,7 +2070,15 @@ def decode_upload_content(item: dict[str, Any]) -> bytes:
     if "content" in item:
         return str(item["content"]).encode("utf-8")
     if "source_path" in item:
+        # Security: restrict source_path to WORKSPACE only — no arbitrary filesystem reads
         source = Path(str(item["source_path"])).expanduser().resolve()
+        try:
+            source.relative_to(WORKSPACE)
+        except ValueError:
+            raise ValueError(
+                f"source_path must be inside the workspace ({WORKSPACE}). "
+                "Use content_base64 or content to upload external files."
+            )
         if not source.exists() or not source.is_file():
             raise ValueError(f"source file missing: {source}")
         if source.stat().st_size > MAX_UPLOAD_BYTES:
@@ -2280,6 +2346,9 @@ def docker_mcp_call(incoming: dict[str, Any], timeout_s: int = 60) -> dict[str, 
     for key, value in arguments.items():
         if isinstance(value, (dict, list)):
             raise ValueError("docker mcp bridge currently allows scalar key=value arguments only")
+        # Security: reject flag-like keys that could inject CLI options
+        if str(key).startswith("-"):
+            raise ValueError(f"argument key '{key}' looks like a flag — not allowed")
         argv.append(f"{key}={value}")
     result = subprocess.run(argv, capture_output=True, text=True, timeout=min(timeout_s, 120), check=False)
     payload = {
@@ -2395,6 +2464,7 @@ def coding_task(incoming: dict[str, Any]) -> dict[str, Any]:
 
 
 def check_or_apply_patch(cwd: str, patch_text: str, title: str, apply_patch: bool) -> dict[str, Any]:
+    _assert_allowed_cwd(cwd)  # Security: block patch application to arbitrary repos
     patch_dir = WORKSPACE / "patches"
     patch_dir.mkdir(parents=True, exist_ok=True)
     patch_path = patch_dir / f"{now_stamp()}_{safe_slug(title)}.patch"
@@ -3064,7 +3134,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _check_auth(self) -> bool:
+        """Return True if request is authorised.
+        If LOCAL_CODER_API_KEY is unset, all requests are allowed (localhost dev mode).
+        If set, require matching X-API-Key or Authorization: Bearer <key> header.
+        """
+        api_key = os.environ.get("LOCAL_CODER_API_KEY", "")
+        if not api_key:
+            return True
+        provided = (
+            self.headers.get("X-API-Key", "")
+            or self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        )
+        return provided == api_key
+
     def do_POST(self) -> None:
+        if not self._check_auth():
+            self._send_json(401, {"error": "Unauthorized — set X-API-Key header matching LOCAL_CODER_API_KEY"})
+            return
         if self.path == "/save":
             self.handle_save()
             return

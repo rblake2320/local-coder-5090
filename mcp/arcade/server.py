@@ -104,7 +104,7 @@ MODEL_STRATEGY = os.environ.get("MODEL_STRATEGY", "bedrock_first")  # local_firs
 
 # Flywheel integration (collects data for training)
 FLYWHEEL_ENABLED = os.environ.get("FLYWHEEL_ENABLED", "true").lower() == "true"
-FLYWHEEL_DATA_DIR = os.environ.get("FLYWHEEL_DATA_DIR", "/home/rblake2320/ai-business/flywheel_data/mcp")
+FLYWHEEL_DATA_DIR = os.environ.get("FLYWHEEL_DATA_DIR", str(Path.home() / "local-coder" / "flywheel" / "mcp"))
 
 # Specialist system prompts
 SPECIALIST_PROMPTS = {
@@ -758,7 +758,7 @@ async def local_coder_status() -> dict:
 async def local_coder_run_safe_tool(
     command: Annotated[str, "Allowlisted command name, such as pwd, ls, rg, git_status, git_diff, pytest, or py_compile"],
     args: Annotated[Optional[list[str]], "Optional command arguments"] = None,
-    cwd: Annotated[str, "Working directory"] = "/home/rblake2320/ai-business",
+    cwd: Annotated[str, "Working directory"] = r"C:\Users\techai\local-coder",
     timeout_s: Annotated[int, "Timeout in seconds"] = 60
 ) -> dict:
     """
@@ -825,7 +825,7 @@ async def local_coder_patch(
 @app.tool
 async def local_coder_coding_loop(
     task: Annotated[str, "Coding task being verified"],
-    cwd: Annotated[str, "Git repository working directory"] = "/home/rblake2320/ai-business",
+    cwd: Annotated[str, "Git repository working directory"] = r"C:\Users\techai\local-coder",
     patch: Annotated[str, "Optional unified diff to check/apply"] = "",
     apply: Annotated[bool, "Apply the patch after git apply --check succeeds"] = False,
     verify_tools: Annotated[Optional[list[dict]], "Verification tool specs such as {'command':'pytest','args':['tests']}"] = None,
