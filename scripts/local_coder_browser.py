@@ -131,6 +131,28 @@ SAFE_TOOL_COMMANDS = {
     "docker_run",
     "psql_query",
     "gh_workflow",
+    # Language linters / formatters
+    "eslint",          # JS/TS: npx eslint
+    "rustfmt",         # Rust: rustfmt --check
+    "cargo_check",     # Rust: cargo check
+    "go_vet",          # Go:   go vet
+    "hadolint",        # Docker: hadolint
+    "clang_format",    # C/C++: clang-format --dry-run
+    "npm_test",        # JS/TS: npm test
+    # Infrastructure / ops
+    "nvidia_smi",      # GPU utilisation (RTX 5090)
+    "checkov",         # IaC compliance (Terraform/Docker/k8s)
+    # Type checking / dependency scanning
+    "mypy",            # Python type checker
+    "pip_audit",       # Python dependency CVE scanner
+    "npm_audit",       # Node.js dependency CVE scanner
+    "semgrep",         # Multi-language SAST (Python/JS/Go/Java/etc.)
+    # Cross-platform / codegen
+    "wsl_exec",        # Run any command inside WSL2 (Unix tools on Windows)
+    "codegen",         # Scaffold project boilerplate from a named template
+    # Stubs (return helpful instructions when binary absent)
+    "kubectl_get",     # Kubernetes — stub if kubectl not found
+    "terraform_plan",  # Terraform plan — stub if tf not found
 }
 TEXT_FILE_SUFFIXES = {
     ".py",
@@ -1797,6 +1819,283 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
         return {"command": command, "argv": argv, "cwd": workdir,
                 "returncode": result.returncode,
                 "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "eslint":
+        # argv = list of files/dirs to lint; defaults to current dir
+        argv = args or ["."]
+        safe_argv = ["npx", "--yes", "eslint", "--max-warnings", "0"] + argv[:12]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "rustfmt":
+        # argv = list of .rs files to check
+        argv = args or []
+        if not argv:
+            return {"command": command, "argv": [], "cwd": workdir,
+                    "returncode": 1, "stdout": "", "stderr": "rustfmt requires at least one .rs file"}
+        safe_argv = ["rustfmt", "--edition", "2021", "--check"] + [a for a in argv[:12] if a.endswith(".rs")]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=60)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "cargo_check":
+        # Runs `cargo check` in the project; argv[0] optionally overrides target (e.g. "--release")
+        argv = args or []
+        safe_flags = [a for a in argv[:4] if a in ("--release", "--tests", "--all-targets", "--message-format=short")]
+        safe_argv = ["cargo", "check", "--message-format=short"] + safe_flags
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "go_vet":
+        # Runs `go vet ./...` in workdir; argv[0] optionally overrides the pattern
+        argv = args or []
+        pattern = argv[0] if argv and not argv[0].startswith("-") else "./..."
+        safe_argv = ["go", "vet", pattern]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "hadolint":
+        # argv[0] = Dockerfile path (default "Dockerfile")
+        argv = args or []
+        dockerfile = argv[0] if argv else "Dockerfile"
+        # Block path traversal
+        if ".." in dockerfile or dockerfile.startswith("/"):
+            raise ValueError("hadolint: invalid Dockerfile path")
+        safe_argv = ["hadolint", "--format", "tty", dockerfile]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=30)
+        write_trace("tool_run", {"command": command, "argv": [dockerfile], "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "clang_format":
+        # argv = list of .c/.cpp/.h files to check (dry-run, no write)
+        argv = args or []
+        if not argv:
+            return {"command": command, "argv": [], "cwd": workdir,
+                    "returncode": 1, "stdout": "", "stderr": "clang_format requires at least one source file"}
+        safe_files = [a for a in argv[:12] if re.match(r'^[\w./\\-]+\.(c|cpp|cc|cxx|h|hpp)$', a)]
+        safe_argv = ["clang-format", "--dry-run", "-Werror"] + safe_files
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=60)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "npm_test":
+        # Runs `npm test` in workdir; block running from upload directories
+        upload_dir = str(UPLOAD_DIR.resolve())
+        if workdir.startswith(upload_dir):
+            raise ValueError("npm_test is not allowed to run from upload directories")
+        argv = args or []
+        safe_argv = ["npm", "test", "--", *[a for a in argv[:8] if not a.startswith("-")]]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=300)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-12000:]}
+    elif command == "nvidia_smi":
+        # Returns GPU utilisation; argv[0] optionally = query (e.g. "--query-gpu=...")
+        argv = args or []
+        allowed_nvidia_flags = {"--query-gpu", "--format=csv,noheader,nounits", "-L", "--list-gpus"}
+        if argv:
+            # Only allow safe query flags
+            safe_argv = ["nvidia-smi"] + [a for a in argv[:6] if any(a.startswith(f) for f in allowed_nvidia_flags)]
+        else:
+            safe_argv = ["nvidia-smi", "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.free,temperature.gpu",
+                         "--format=csv,noheader"]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=15)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "checkov":
+        # IaC compliance scanner; argv[0] = directory to scan (default ".")
+        argv = args or []
+        target = argv[0] if argv and not argv[0].startswith("-") else "."
+        if ".." in target:
+            raise ValueError("checkov: path traversal not allowed")
+        safe_argv = [sys.executable, "-m", "checkov", "-d", target, "--compact", "--quiet"]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "kubectl_get":
+        # Stub: runs `kubectl get <resource>` if kubectl is present; otherwise returns install instructions
+        if not shutil.which("kubectl"):
+            return {
+                "command": command, "argv": args or [], "cwd": workdir, "returncode": 127,
+                "stdout": "",
+                "stderr": (
+                    "kubectl not found. Install: https://kubernetes.io/docs/tasks/tools/install-kubectl-windows/\n"
+                    "  winget install Kubernetes.kubectl\n"
+                    "After install, configure ~/.kube/config with your cluster credentials."
+                ),
+            }
+        argv = args or ["pods"]
+        safe_argv = ["kubectl", "get"] + [a for a in argv[:6] if re.match(r'^[\w./,-]+$', a)]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=30)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "terraform_plan":
+        # Stub: runs `terraform plan` if terraform is present; otherwise returns install instructions
+        if not shutil.which("terraform"):
+            return {
+                "command": command, "argv": args or [], "cwd": workdir, "returncode": 127,
+                "stdout": "",
+                "stderr": (
+                    "terraform not found. Install: https://developer.hashicorp.com/terraform/install\n"
+                    "  winget install Hashicorp.Terraform\n"
+                    "Run `terraform init` in your IaC directory before running terraform_plan."
+                ),
+            }
+        safe_argv = ["terraform", "plan", "-input=false"]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=300)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-12000:]}
+    elif command == "mypy":
+        argv = args or ["."]
+        safe_argv = [sys.executable, "-m", "mypy", "--ignore-missing-imports", "--show-error-codes"] + argv[:12]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-3000:]}
+    elif command == "pip_audit":
+        argv = args or []
+        req_file = argv[0] if argv and argv[0].endswith(".txt") and ".." not in argv[0] else None
+        safe_argv = [sys.executable, "-m", "pip_audit", "--format", "json"]
+        if req_file:
+            safe_argv += ["-r", req_file]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-3000:]}
+    elif command == "npm_audit":
+        argv = args or []
+        fix_flag = ["--fix"] if argv and argv[0] == "--fix" else []
+        safe_argv = ["npm", "audit", "--json"] + fix_flag
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-3000:]}
+    elif command == "semgrep":
+        argv = args or []
+        config = argv[0] if argv and re.match(r'^[\w./:-]+$', argv[0]) else "auto"
+        target = argv[1] if len(argv) > 1 and ".." not in argv[1] else "."
+        if not shutil.which("semgrep"):
+            return {"command": command, "argv": [config, target], "cwd": workdir, "returncode": 127,
+                    "stdout": "", "stderr": "semgrep not found — install: pip install semgrep"}
+        safe_argv = ["semgrep", "--config", config, "--json", "--quiet", target]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=180)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-3000:]}
+    elif command == "wsl_exec":
+        argv = args or []
+        if not argv:
+            return {"command": command, "argv": [], "cwd": workdir, "returncode": 1,
+                    "stdout": "", "stderr": "wsl_exec requires a shell command string as argv[0]"}
+        shell_cmd = argv[0]
+        if re.search(r'(rm\s+-rf\s+/|mkfs|dd\s+if=|:\(\)\{|curl[^|]+\|[^|]*sh|wget[^|]+\|[^|]*sh)', shell_cmd):
+            raise ValueError("wsl_exec: blocked dangerous command pattern")
+        if not shutil.which("wsl"):
+            return {"command": command, "argv": [shell_cmd], "cwd": workdir, "returncode": 127,
+                    "stdout": "", "stderr": "WSL2 not found — run: wsl --install"}
+        safe_argv = ["wsl", "--", "bash", "-c", shell_cmd]
+        result = subprocess.run(safe_argv, capture_output=True, text=True, cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": [shell_cmd], "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": [shell_cmd], "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-12000:], "stderr": result.stderr[-3000:]}
+    elif command == "codegen":
+        _TEMPLATES: dict[str, list[tuple[str, str]]] = {
+            "django": [
+                ("requirements.txt", "django>=4.2\ngunicorn\npython-dotenv\n"),
+                ("manage.py", "#!/usr/bin/env python\nimport os, sys\nif __name__ == '__main__':\n    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')\n    from django.core.management import execute_from_command_line\n    execute_from_command_line(sys.argv)\n"),
+                (".env.example", "DEBUG=True\nSECRET_KEY=changeme\nDATABASE_URL=sqlite:///db.sqlite3\n"),
+                ("config/__init__.py", ""),
+                ("config/settings.py", "from pathlib import Path\nimport os\nBASE_DIR = Path(__file__).resolve().parent.parent\nSECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret')\nDEBUG = os.environ.get('DEBUG', 'True') == 'True'\nALLOWED_HOSTS = ['*']\nINSTALLED_APPS = ['django.contrib.admin','django.contrib.auth','django.contrib.contenttypes','django.contrib.sessions','django.contrib.messages','django.contrib.staticfiles']\nDATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}\nSTATIC_URL = '/static/'\n"),
+                ("config/urls.py", "from django.contrib import admin\nfrom django.urls import path\nurlpatterns = [path('admin/', admin.site.urls)]\n"),
+            ],
+            "fastapi": [
+                ("requirements.txt", "fastapi>=0.110\nuvicorn[standard]\npydantic>=2\npython-dotenv\n"),
+                ("main.py", "from fastapi import FastAPI\nfrom pydantic import BaseModel\n\napp = FastAPI(title='My API')\n\nclass Item(BaseModel):\n    name: str\n    value: float\n\n@app.get('/health')\ndef health(): return {'status': 'ok'}\n\n@app.post('/items')\ndef create_item(item: Item): return item\n"),
+                (".env.example", "PORT=8000\nDEBUG=true\n"),
+                ("Dockerfile", "FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\nCOPY . .\nEXPOSE 8000\nCMD [\"uvicorn\", \"main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\"]\n"),
+            ],
+            "react": [
+                ("package.json", '{\n  "name": "my-app",\n  "version": "0.1.0",\n  "private": true,\n  "scripts": {"start": "vite", "build": "vite build", "preview": "vite preview"},\n  "dependencies": {"react": "^18", "react-dom": "^18"},\n  "devDependencies": {"@vitejs/plugin-react": "^4", "vite": "^5"}\n}\n'),
+                ("vite.config.js", 'import { defineConfig } from "vite"\nimport react from "@vitejs/plugin-react"\nexport default defineConfig({ plugins: [react()] })\n'),
+                ("index.html", '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>App</title></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>\n'),
+                ("src/main.jsx", 'import React from "react"\nimport { createRoot } from "react-dom/client"\nimport App from "./App"\ncreateRoot(document.getElementById("root")).render(<App />)\n'),
+                ("src/App.jsx", 'export default function App() { return <h1>Hello World</h1> }\n'),
+            ],
+            "github-action": [
+                (".github/workflows/ci.yml", "name: CI\non:\n  push:\n    branches: [main]\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-python@v5\n        with:\n          python-version: '3.12'\n      - run: pip install -r requirements.txt\n      - run: pytest\n"),
+            ],
+            "flask": [
+                ("requirements.txt", "flask>=3.0\npython-dotenv\ngunicorn\n"),
+                ("app.py", "from flask import Flask, jsonify\napp = Flask(__name__)\n\n@app.route('/health')\ndef health(): return jsonify({'status': 'ok'})\n\nif __name__ == '__main__':\n    app.run(debug=True)\n"),
+                (".env.example", "FLASK_ENV=development\nFLASK_APP=app.py\n"),
+            ],
+            "cli": [
+                ("main.py", "#!/usr/bin/env python3\nimport argparse\n\ndef main():\n    parser = argparse.ArgumentParser(description='My CLI tool')\n    parser.add_argument('--verbose', '-v', action='store_true')\n    parser.add_argument('input', nargs='?', default='-')\n    args = parser.parse_args()\n    print(f'Input: {args.input}, verbose: {args.verbose}')\n\nif __name__ == '__main__':\n    main()\n"),
+                ("requirements.txt", "# add dependencies here\n"),
+                ("pyproject.toml", '[build-system]\nrequires = ["setuptools>=68"]\nbuild-backend = "setuptools.backends.legacy:build"\n\n[project]\nname = "my-cli"\nversion = "0.1.0"\nrequires-python = ">=3.12"\n\n[project.scripts]\nmy-cli = "main:main"\n'),
+            ],
+        }
+        argv = args or []
+        template_name = argv[0].lower() if argv else ""
+        out_dir_raw = argv[1] if len(argv) > 1 else template_name or "project"
+        if not template_name or template_name not in _TEMPLATES:
+            return {
+                "command": command, "argv": argv, "cwd": workdir, "returncode": 1,
+                "stdout": "", "stderr": f"Unknown template '{template_name}'. Available: {', '.join(sorted(_TEMPLATES))}",
+            }
+        if ".." in out_dir_raw or out_dir_raw.startswith("/"):
+            raise ValueError("codegen: invalid output directory")
+        out_dir = Path(workdir) / out_dir_raw
+        files_written: list[str] = []
+        for rel_path, content in _TEMPLATES[template_name]:
+            dest = out_dir / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+            files_written.append(str(Path(rel_path)))
+        write_trace("tool_run", {"command": command, "template": template_name, "out_dir": str(out_dir),
+                                 "files": files_written})
+        return {"command": command, "template": template_name, "out_dir": str(out_dir),
+                "returncode": 0,
+                "stdout": f"Scaffolded '{template_name}' → {out_dir_raw}/\n" + "\n".join(f"  {f}" for f in files_written),
+                "stderr": ""}
     else:
         raise ValueError(f"tool not implemented: {command}")
     result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -2889,22 +3188,29 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "- **web_fetch** – fetch any URL and return its text content (SSRF-protected).\n"
         "- **File upload** – users can upload .py .js .ts .json .zip .tar.gz files for you to analyse.\n"
         "- **Skills system** – your plugin/extensibility layer. Users can create and save custom skills via /skills. This IS your toolchain plugin system.\n"
-        "- **Git tools** – git_status and git_diff are available. git_commit and git_push are now also available.\n"
+        "- **Git tools** – git_status, git_diff, git_commit, git_push are all available.\n"
         "- **Patch apply** – apply unified diffs with automatic file backup for easy rollback.\n"
         "- **Project memory** – persistent key-value store per project path, survives server restarts.\n"
-        "- **Performance profiling** – cprofile command profiles any Python script.\n"
+        "- **Performance profiling** – cprofile command profiles any Python script; mem_profile (tracemalloc) for memory analysis.\n"
         "- **Coding task loop** – /coding/task endpoint runs multi-step tasks with auto-retry.\n"
         "- **MCP integration** – connect to external MCP tool servers for additional capabilities.\n"
-        "- **Provider fallback** – Ollama (local, you!) → OpenRouter (set OPENROUTER_API_KEY) → AWS Bedrock → NVIDIA NIM. UI dropdown lets users force any backend.\n"
+        "- **Provider fallback** – Ollama (local) → OpenRouter (OPENROUTER_API_KEY) → AWS Bedrock → NVIDIA NIM. UI dropdown forces any backend.\n"
+        "- **Type checking** – mypy tool runs Python type analysis with --ignore-missing-imports.\n"
+        "- **Dependency CVE scanning** – pip_audit (Python) and npm_audit (Node.js) scan for known vulnerabilities.\n"
+        "- **Multi-language SAST** – semgrep tool supports Python, JS, Go, Java, C/C++, and more (config: auto, p/python, p/javascript, etc.).\n"
+        "- **WSL2 exec** – wsl_exec tool runs Unix shell commands (gdb, valgrind, cmake, make) through WSL2 from Windows.\n"
+        "- **Code scaffolding** – codegen tool writes project boilerplate: django, fastapi, react, flask, cli, github-action.\n"
         "- **Runtime** – you ARE the local LLM (qwen3:32b). You run on RTX 5090, 32 GB VRAM, 128 GB RAM. Zero cloud latency. Fully private.\n"
-        "- **OS** – Windows 11 with full tool access: pytest, rg, git, dir, where, py_compile.\n"
+        "- **OS** – Windows 11 with full tool access: pytest, rg, git, dir, where, py_compile, py_debug.\n"
         "- **Settings** – /settings GET/POST stores persistent JSON config in workspace/settings.json.\n"
-        "- **Security Auditing** – bandit tool scans Python for vulnerabilities.\n"
-        "- **Memory Profiling** – mem_profile tool uses tracemalloc for memory analysis.\n"
+        "- **Security Auditing** – bandit (Python), eslint (JS/TS linting), hadolint (Dockerfile), checkov (IaC compliance).\n"
         "- **Docker** – docker_run tool for container management (requires Docker Desktop).\n"
         "- **Database** – psql_query tool for PostgreSQL queries.\n"
         "- **CI/CD** – gh_workflow tool triggers GitHub Actions workflows.\n"
-        "- **Multi-language files** – upload and analyse Rust, Go, C++, Java, and any text-based source.\n"
+        "- **Multi-language tooling** – eslint (JS/TS), rustfmt (Rust format check), cargo_check (Rust compile check), go_vet (Go static analysis), clang_format (C/C++ dry-run), npm_test (JS test runner).\n"
+        "- **GPU monitoring** – nvidia_smi reports RTX 5090 utilisation, memory usage, and temperature in real time.\n"
+        "- **Kubernetes** – kubectl_get (returns install instructions if kubectl is absent).\n"
+        "- **Terraform** – terraform_plan (returns install instructions if terraform is absent).\n"
         "- **IDE bridge** – the /chat API is OpenAI-compatible; connect any IDE plugin that supports custom endpoints.\n"
         "- **LoRA fine-tuning** – RTX 5090 + 128 GB RAM supports local fine-tuning workflows.",
         f"Context mode: {mode} ({mode_config['ctx']} tokens available on the running model).",
@@ -3605,6 +3911,16 @@ def a2a_agent_card() -> dict[str, Any]:
                     "semantic_process_doctrine",
                     "semantic_process_interpreter",
                     "evidence_traces",
+                    "eslint_js_ts_linting",
+                    "rust_toolchain",
+                    "go_vet",
+                    "clang_format_cpp",
+                    "npm_test",
+                    "hadolint_dockerfile",
+                    "checkov_iac_compliance",
+                    "gpu_monitoring_nvidia_smi",
+                    "kubectl_stub",
+                    "terraform_stub",
                 ],
                 "task_endpoint": f"{PUBLIC_BASE}/a2a/tasks",
             }
