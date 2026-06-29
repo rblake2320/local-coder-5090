@@ -150,6 +150,14 @@ SAFE_TOOL_COMMANDS = {
     # Cross-platform / codegen
     "wsl_exec",        # Run any command inside WSL2 (Unix tools on Windows)
     "codegen",         # Scaffold project boilerplate from a named template
+    # SelfConnect Win32 SDK
+    "sc_list_windows", # List all visible desktop windows (hwnd, title, exe)
+    "sc_find",         # Find a window by title/exe/class (fuzzy match)
+    "sc_send",         # Inject text into a window via PostMessage(WM_CHAR)
+    "sc_capture",      # Screenshot a window via PrintWindow (background-safe)
+    "sc_read",         # Read window text via UIA (zero-inference)
+    "sc_click",        # Click at window-relative coordinates
+    "sc_clipboard",    # Read or write the system clipboard
     # Stubs (return helpful instructions when binary absent)
     "kubectl_get",     # Kubernetes — stub if kubectl not found
     "terraform_plan",  # Terraform plan — stub if tf not found
@@ -2096,6 +2104,108 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
                 "returncode": 0,
                 "stdout": f"Scaffolded '{template_name}' → {out_dir_raw}/\n" + "\n".join(f"  {f}" for f in files_written),
                 "stderr": ""}
+
+    # ── SelfConnect Win32 SDK tools ──────────────────────────────────────────
+    # All sc_* tools run one-liner Python scripts against the selfconnect SDK.
+    # SDK path: C:\Users\techai\selfconnect-sdk  (cloned from rblake2320/selfconnect)
+    elif command in {"sc_list_windows", "sc_find", "sc_send", "sc_capture", "sc_read", "sc_click", "sc_clipboard"}:
+        SC_SDK = r"C:\Users\techai\selfconnect-sdk"
+        if not Path(SC_SDK).exists():
+            return {"command": command, "argv": args or [], "cwd": workdir, "returncode": 127,
+                    "stdout": "", "stderr": f"SelfConnect SDK not found at {SC_SDK}. Clone: git clone https://github.com/rblake2320/selfconnect.git {SC_SDK}"}
+
+        if command == "sc_list_windows":
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import list_windows;"
+                "wins = list_windows();"
+                "[print(f'hwnd={w.hwnd:10d}  exe={w.exe or \"?\":30s}  {w.title}') for w in wins];"
+                "print(f'total: {len(wins)} windows')"
+            )
+        elif command == "sc_find":
+            query = (args or [""])[0].replace("'", "\\'")
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import find_target;"
+                f"t = find_target('{query}');"
+                "print(t) if t else print('No window found matching: " + query + "')"
+            )
+        elif command == "sc_send":
+            # args[0] = window query, args[1] = text to inject
+            if not args or len(args) < 2:
+                return {"command": command, "argv": args or [], "cwd": workdir, "returncode": 1,
+                        "stdout": "", "stderr": "sc_send requires args[0]=window_query, args[1]=text"}
+            query = args[0].replace("'", "\\'")
+            text = args[1].replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import find_target, send_string;"
+                f"t = find_target('{query}');"
+                "assert t, 'window not found';"
+                f"send_string(t, '{text}');"
+                f"print(f'Sent to {{t.hwnd}} ({query}): {repr(text)}')"
+            )
+        elif command == "sc_capture":
+            query = (args or [""])[0].replace("'", "\\'")
+            out_path = (args[1] if len(args or []) > 1 else r"C:\Users\techai\local-coder\workspace\capture.png").replace("\\", "\\\\")
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import find_target, save_capture;"
+                f"t = find_target('{query}');"
+                "assert t, 'window not found';"
+                f"path = save_capture(t.hwnd, r'{out_path}');"
+                "print(f'Saved capture to: {{path}}')"
+            )
+        elif command == "sc_read":
+            query = (args or [""])[0].replace("'", "\\'")
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import find_target, get_text_uia, get_window_text;"
+                f"t = find_target('{query}');"
+                "assert t, 'window not found';"
+                "text = get_text_uia(t.hwnd) or get_window_text(t.hwnd) or '';"
+                "print(text[:4000])"
+            )
+        elif command == "sc_click":
+            if not args or len(args) < 3:
+                return {"command": command, "argv": args or [], "cwd": workdir, "returncode": 1,
+                        "stdout": "", "stderr": "sc_click requires args[0]=window_query, args[1]=x, args[2]=y"}
+            query = args[0].replace("'", "\\'")
+            x, y = args[1], args[2]
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import find_target, click_at;"
+                f"t = find_target('{query}');"
+                "assert t, 'window not found';"
+                f"click_at(t.hwnd, {x}, {y});"
+                f"print(f'Clicked at ({x},{y}) in {{t.title}}')"
+            )
+        else:  # sc_clipboard
+            if args and args[0] == "write":
+                text = (args[1] if len(args) > 1 else "").replace("'", "\\'")
+                snippet = (
+                    "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                    "from self_connect import write_clipboard;"
+                    f"write_clipboard('{text}');"
+                    "print('Clipboard written')"
+                )
+            else:
+                snippet = (
+                    "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                    "from self_connect import read_clipboard;"
+                    "print(read_clipboard() or '(empty)')"
+                )
+
+        sc_result = subprocess.run(
+            [sys.executable, "-c", snippet],
+            capture_output=True, text=True, cwd=SC_SDK, timeout=30
+        )
+        write_trace("tool_run", {"command": command, "argv": args or [], "cwd": SC_SDK,
+                                 "returncode": sc_result.returncode})
+        return {"command": command, "argv": args or [], "cwd": SC_SDK,
+                "returncode": sc_result.returncode,
+                "stdout": sc_result.stdout[-8000:], "stderr": sc_result.stderr[-2000:]}
+
     else:
         raise ValueError(f"tool not implemented: {command}")
     result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -3200,6 +3310,7 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "- **Multi-language SAST** – semgrep tool supports Python, JS, Go, Java, C/C++, and more (config: auto, p/python, p/javascript, etc.).\n"
         "- **WSL2 exec** – wsl_exec tool runs Unix shell commands (gdb, valgrind, cmake, make) through WSL2 from Windows.\n"
         "- **Code scaffolding** – codegen tool writes project boilerplate: django, fastapi, react, flask, cli, github-action.\n"
+        "- **SelfConnect Win32 SDK** – direct control of Windows desktop apps outside this terminal: sc_list_windows (enumerate), sc_find (locate window), sc_send (inject text via PostMessage/WM_CHAR — background-safe), sc_capture (screenshot via PrintWindow), sc_read (UIA text extraction), sc_click (mouse), sc_clipboard (read/write). SDK at C:\\Users\\techai\\selfconnect-sdk.\n"
         "- **Runtime** – you ARE the local LLM (qwen3:32b). You run on RTX 5090, 32 GB VRAM, 128 GB RAM. Zero cloud latency. Fully private.\n"
         "- **OS** – Windows 11 with full tool access: pytest, rg, git, dir, where, py_compile, py_debug.\n"
         "- **Settings** – /settings GET/POST stores persistent JSON config in workspace/settings.json.\n"
