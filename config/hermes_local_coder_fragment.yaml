@@ -4,8 +4,8 @@
 local_coder_5090:
   base_url: "http://127.0.0.1:8022"
   model_base: "http://localhost:11434"
-  model: "deepseek-r1:32b"
-  fast_model: "gemma3:latest"
+  model: "qwen3:32b"
+  fast_model: "gemma4:latest"
   v1_url: "http://127.0.0.1:8022/v1"
   chat_endpoint: "http://127.0.0.1:8022/chat"
   capabilities:

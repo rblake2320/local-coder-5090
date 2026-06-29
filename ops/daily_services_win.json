@@ -12,22 +12,6 @@
     }
   },
   "models": {
-    "deepseek-r1:32b": {
-      "role": "primary",
-      "use_case": "coding + reasoning",
-      "vram_gb": 20,
-      "ollama_name": "deepseek-r1:32b",
-      "context_tokens": 131072,
-      "notes": "Pull: ollama pull deepseek-r1:32b"
-    },
-    "gemma3:latest": {
-      "role": "fast",
-      "use_case": "quick completions, tool calls",
-      "vram_gb": 7,
-      "ollama_name": "gemma3:latest",
-      "context_tokens": 32768,
-      "notes": "Pull: ollama pull gemma3"
-    },
     "llama3.1:70b": {
       "role": "heavy",
       "use_case": "long-context analysis",
@@ -35,6 +19,22 @@
       "ollama_name": "llama3.1:70b",
       "context_tokens": 131072,
       "notes": "Pull: ollama pull llama3.1:70b"
+    },
+    "qwen3:32b": {
+      "role": "primary",
+      "use_case": "coding + reasoning",
+      "vram_gb": 20,
+      "ollama_name": "qwen3:32b",
+      "context_tokens": 131072,
+      "notes": "Pull: ollama pull qwen3:32b"
+    },
+    "gemma4:latest": {
+      "role": "fast",
+      "use_case": "quick completions, tool calls",
+      "vram_gb": 7,
+      "ollama_name": "gemma4:latest",
+      "context_tokens": 32768,
+      "notes": "Pull: ollama pull gemma4"
     }
   },
   "ollama": {

@@ -3,8 +3,8 @@
 
 Ported from DGX Spark (Qwen3-Coder-Next 80B / llama.cpp):
   Model backend  : Ollama  http://localhost:11434  (OpenAI-compat)
-  Primary model  : deepseek-r1:32b  (~20 GB VRAM, reasoning + coding)
-  Fast tier      : gemma3:latest    (<1 s simple completions)
+  Primary model  : qwen3:32b  (~20 GB VRAM, reasoning + coding)
+  Fast tier      : gemma4:latest   (<1 s simple completions)
   Workspace      : C:/Users/techai/local-coder/workspace
   Service mgmt   : NSSM  (see install-service.ps1)
 
@@ -46,18 +46,19 @@ HOST = "127.0.0.1"
 PORT = 8022
 # Ollama OpenAI-compat on RTX 5090
 MODEL_BASE = os.environ.get("LOCAL_CODER_MODEL_BASE", "http://localhost:11434")
-# deepseek-r1:32b: reasoning+coding ~20 GB VRAM.  gemma3:latest: fast tier <1s
-MODEL = os.environ.get("LOCAL_CODER_MODEL", "deepseek-r1:32b")
-FAST_MODEL = os.environ.get("LOCAL_CODER_FAST_MODEL", "gemma3:latest")
+# qwen3:32b: reasoning+coding, 32.8B.  gemma4:latest: fast tier 8B
+# Override via env: LOCAL_CODER_MODEL and LOCAL_CODER_FAST_MODEL
+MODEL = os.environ.get("LOCAL_CODER_MODEL", "qwen3:32b")
+FAST_MODEL = os.environ.get("LOCAL_CODER_FAST_MODEL", "gemma4:latest")
 MODEL_OPTIONS = [
     {
-        "id": "deepseek-r1:32b",
+        "id": "qwen3:32b",
         "role": "daily_local_default",
         "status": "active_local",
         "context_tokens": 262144,
         "runner": "ollama",
         "fit": "verified_on_5090",
-        "notes": "Primary model on RTX 5090 via Ollama. deepseek-r1:32b ~20 GB VRAM.",
+        "notes": "Primary model on RTX 5090. qwen3:32b via Ollama, ~20 GB VRAM.",
     },
     {
         "id": "glm-5.2-api-option",
@@ -518,7 +519,7 @@ HTML = """<!doctype html>
   </div>
   <script>
     const storeKey = "local-coder-ui-v1";
-    const model = "deepseek-r1:32b";
+    const model = "qwen3:32b";
     const els = {
       sessions: document.getElementById("sessions"),
       messages: document.getElementById("messages"),
@@ -889,7 +890,7 @@ PALETTE_HTML = """<!doctype html>
 
 
 def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
-    """Route to FAST_MODEL (gemma3, <1 s) or MODEL (deepseek-r1:32b) based on task size.
+    """Route to FAST_MODEL (gemma4, <1 s) or MODEL (qwen3:32b) based on task size.
     Ollama requires the model field in every request.
     """
     model_to_use = FAST_MODEL if fast else MODEL
@@ -2320,10 +2321,18 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "repo_context": None if repo_context is None else {key: value for key, value in repo_context.items() if key != "context"},
         "memory_path": str(project_memory_path(incoming.get("project_path"))),
     }
+    model = str(incoming.get("model") or MODEL)
+    requested_tokens = int(incoming.get("max_tokens", mode_config["max_tokens"]))
+    # Reserve overhead for qwen3/deepseek-r1 thinking blocks so the answer isn't truncated
+    effective_tokens = (
+        requested_tokens + _THINKING_OVERHEAD
+        if _is_thinking_model(model)
+        else requested_tokens
+    )
     payload = {
-        "model": str(incoming.get("model") or MODEL),
+        "model": model,
         "messages": enriched,
-        "max_tokens": int(incoming.get("max_tokens", mode_config["max_tokens"])),
+        "max_tokens": effective_tokens,
         "temperature": float(incoming.get("temperature", 0)),
         "stream": False,
     }
@@ -2958,15 +2967,33 @@ def a2a_agent_card() -> dict[str, Any]:
     }
 
 
+_THINKING_MODELS = {"qwen3", "qwen3.6", "deepseek-r1", "deepseek-r1.5", "qwq"}
+_THINKING_OVERHEAD = 2048  # reserved tokens for <think> block on reasoning models
+
+
+def _is_thinking_model(model_name: str) -> bool:
+    name = (model_name or "").lower()
+    return any(name.startswith(prefix) or f":{prefix}" in name for prefix in _THINKING_MODELS)
+
+
 def chat_payload_from_incoming(incoming: dict[str, Any]) -> dict[str, Any]:
     messages = incoming.get("messages")
     if not isinstance(messages, list):
         prompt = str(incoming.get("prompt", ""))
         messages = [{"role": "user", "content": prompt}]
+    model = str(incoming.get("model") or MODEL)
+    requested_tokens = int(incoming.get("max_tokens", 1024))
+    # Qwen3 / DeepSeek-R1 spend tokens on <think> blocks before producing content.
+    # Reserve overhead so the actual answer is never truncated by budget.
+    effective_tokens = (
+        requested_tokens + _THINKING_OVERHEAD
+        if _is_thinking_model(model)
+        else requested_tokens
+    )
     return {
-        "model": str(incoming.get("model") or MODEL),
+        "model": model,
         "messages": messages,
-        "max_tokens": int(incoming.get("max_tokens", 1024)),
+        "max_tokens": effective_tokens,
         "temperature": float(incoming.get("temperature", 0)),
         "stream": False,
     }
@@ -2974,7 +3001,14 @@ def chat_payload_from_incoming(incoming: dict[str, Any]) -> dict[str, Any]:
 
 def chat_response(raw: dict[str, Any]) -> dict[str, Any]:
     choices = raw.get("choices", [])
-    content = choices[0].get("message", {}).get("content", "") if choices else ""
+    msg = choices[0].get("message", {}) if choices else {}
+    content = msg.get("content", "")
+    # Qwen3 / DeepSeek-R1: Ollama puts <think> text in "reasoning"; content holds the answer.
+    # If content is empty but reasoning is present, the thinking block exhausted the budget —
+    # return the last paragraph of reasoning as a fallback so the caller sees something useful.
+    if not content and msg.get("reasoning"):
+        last_para = msg["reasoning"].rstrip().rsplit("\n\n", 1)[-1].strip()
+        content = f"[thinking only — increase max_tokens]\n{last_para}"
     return {"content": content, "usage": raw.get("usage", {}), "raw": raw}
 
 
