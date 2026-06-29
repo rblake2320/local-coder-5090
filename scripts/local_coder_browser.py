@@ -31,6 +31,8 @@ import re
 import shutil
 import subprocess
 import tarfile
+import threading
+import time
 import webbrowser
 import zipfile
 from datetime import datetime, timezone
@@ -889,20 +891,188 @@ PALETTE_HTML = """<!doctype html>
 """
 
 
+class _CircuitBreaker:
+    """Simple circuit breaker for Ollama backend requests."""
+
+    THRESHOLD = 3
+    OPEN_SECONDS = 30
+
+    def __init__(self) -> None:
+        self._state: str = "CLOSED"
+        self._failures: int = 0
+        self._opened_at: float = 0.0
+        self._lock = threading.Lock()
+
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._state == "OPEN":
+                if time.monotonic() - self._opened_at > self.OPEN_SECONDS:
+                    self._state = "HALF_OPEN"
+                    return False
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            if self._state != "CLOSED":
+                self._state = "CLOSED"
+                self._failures = 0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures >= self.THRESHOLD:
+                self._state = "OPEN"
+                self._opened_at = time.monotonic()
+
+
+_cb = _CircuitBreaker()
+
+
 def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
-    """Route to FAST_MODEL (gemma4, <1 s) or MODEL (qwen3:32b) based on task size.
-    Ollama requires the model field in every request.
+    """Route to FAST_MODEL or MODEL with Ollama -> Bedrock -> NIM fallback chain."""
+    model_to_use = FAST_MODEL if fast else MODEL
+    send_payload = {**payload, "model": model_to_use, "stream": False}
+    last_exc: Exception | None = None
+
+    # --- Backend 1: Ollama ---
+    if not _cb.is_open():
+        try:
+            req = Request(
+                f"{MODEL_BASE}/v1/chat/completions",
+                data=json.dumps(send_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=1800) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            _cb.record_success()
+            result["backend_used"] = "ollama"
+            return result
+        except (URLError, TimeoutError, OSError) as exc:
+            _cb.record_failure()
+            last_exc = exc
+
+    # --- Backend 2: AWS Bedrock ---
+    try:
+        import boto3  # type: ignore[import]
+        bedrock_model_id = os.environ.get(
+            "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"
+        )
+        client = boto3.client("bedrock-runtime")
+        messages = send_payload.get("messages", [])
+        system_msgs = [m["content"] for m in messages if m.get("role") == "system"]
+        user_msgs = [m for m in messages if m.get("role") != "system"]
+        bedrock_body: dict[str, Any] = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": send_payload.get("max_tokens", 4096),
+            "messages": user_msgs,
+        }
+        if system_msgs:
+            bedrock_body["system"] = "\n".join(system_msgs)
+        br_response = client.invoke_model(
+            modelId=bedrock_model_id,
+            body=json.dumps(bedrock_body),
+            contentType="application/json",
+            accept="application/json",
+        )
+        br_result = json.loads(br_response["body"].read().decode("utf-8"))
+        result = {
+            "id": br_result.get("id", ""),
+            "object": "chat.completion",
+            "model": bedrock_model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": br_result.get("content", [{}])[0].get("text", ""),
+                    },
+                    "finish_reason": br_result.get("stop_reason", "stop"),
+                }
+            ],
+            "usage": br_result.get("usage", {}),
+            "backend_used": "bedrock",
+        }
+        return result
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+
+    # --- Backend 3: NIM ---
+    try:
+        nim_base = os.environ.get("NIM_BASE", "https://integrate.api.nvidia.com/v1")
+        nim_key = os.environ.get("NVIDIA_API_KEY", "")
+        nim_payload = {**send_payload}
+        nim_req = Request(
+            f"{nim_base}/chat/completions",
+            data=json.dumps(nim_payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {nim_key}",
+            },
+            method="POST",
+        )
+        with urlopen(nim_req, timeout=1800) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        result["backend_used"] = "nim"
+        return result
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+
+    raise RuntimeError("All backends failed") from last_exc
+
+
+def post_model_stream(payload: dict[str, Any], fast: bool = False):
+    """Same backend fallback as post_model but yields SSE content chunks.
+
+    Streams from Ollama when available; falls back to Bedrock/NIM as single chunks.
     """
     model_to_use = FAST_MODEL if fast else MODEL
-    send_payload = {**payload, "model": model_to_use}
-    req = Request(
-        f"{MODEL_BASE}/v1/chat/completions",
-        data=json.dumps(send_payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urlopen(req, timeout=1800) as response:
-        return json.loads(response.read().decode("utf-8"))
+    send_payload = {**payload, "model": model_to_use, "stream": True}
+    last_exc: Exception | None = None
+
+    # --- Backend 1: Ollama (streaming) ---
+    if not _cb.is_open():
+        try:
+            req = Request(
+                f"{MODEL_BASE}/v1/chat/completions",
+                data=json.dumps(send_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=1800) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").rstrip("\n\r")
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        return
+                    try:
+                        chunk = json.loads(data_str)
+                        content = chunk["choices"][0]["delta"].get("content", "")
+                        if content:
+                            yield content
+                    except (KeyError, json.JSONDecodeError):
+                        continue
+            _cb.record_success()
+            return
+        except (URLError, TimeoutError, OSError) as exc:
+            _cb.record_failure()
+            last_exc = exc
+
+    # --- Fallback: non-streaming, wrap as single chunk ---
+    try:
+        non_stream_payload = {**payload, "stream": False}
+        result = post_model(non_stream_payload, fast=fast)
+        content = result["choices"][0]["message"].get("content", "")
+        if content:
+            yield content
+        return
+    except Exception as exc:  # noqa: BLE001
+        last_exc = exc
+
+    raise RuntimeError("All streaming backends failed") from last_exc
 
 
 def get_json(url: str, timeout: int = 5) -> dict[str, Any]:
@@ -1212,6 +1382,15 @@ def repo_files(project_path: Path, limit: int = 5000) -> list[Path]:
     return files
 
 
+def score_file_content(path: Path, terms: set[str]) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:200]
+        text = "\n".join(lines).lower()
+        return sum(text.count(term) for term in terms)
+    except Exception:
+        return 0
+
+
 def compile_repo_context(project_path: str | None, request: str, mode: str = "fast") -> dict[str, Any]:
     if not project_path:
         return {"project_path": "", "mode": mode, "files": [], "context": "", "tokens_estimate": 0}
@@ -1244,6 +1423,28 @@ def compile_repo_context(project_path: str | None, request: str, mode: str = "fa
                     break
             if targeted:
                 break
+        if len(targeted) < 10:
+            content_candidates: list[tuple[int, Path]] = []
+            targeted_set = set(targeted)
+            for dirname in common_dirs:
+                base = root / dirname
+                if not base.exists():
+                    continue
+                for walk_root, dirs, names in os.walk(base):
+                    dirs[:] = [item for item in dirs if item not in ignored_parts]
+                    for name in names:
+                        path = Path(walk_root) / name
+                        if is_text_file(path) and path not in targeted_set:
+                            content_score = score_file_content(path, terms)
+                            if content_score > 0:
+                                content_candidates.append((content_score, path))
+            content_candidates.sort(key=lambda item: -item[0])
+            for _score, path in content_candidates[:10]:
+                if path not in targeted_set:
+                    targeted.append(path)
+                    targeted_set.add(path)
+                    if len(targeted) >= 20:
+                        break
     candidates: list[tuple[int, Path]] = []
     seen_paths: set[Path] = set()
     broad_files = [] if targeted else repo_files(root)
@@ -2503,24 +2704,66 @@ def check_or_apply_patch(cwd: str, patch_text: str, title: str, apply_patch: boo
 def coding_loop(incoming: dict[str, Any]) -> dict[str, Any]:
     cwd = str(Path(incoming.get("cwd") or incoming.get("project_path") or AI_BUSINESS).expanduser().resolve())
     title = str(incoming.get("title") or incoming.get("task") or "coding-loop")
+    max_attempts = int(incoming.get("max_attempts", 3))
+    auto_retry = bool(incoming.get("auto_retry", True))
     patch_result = None
-    if str(incoming.get("patch", "")).strip():
-        patch_result = check_or_apply_patch(cwd, str(incoming["patch"]), title, bool(incoming.get("apply", False)))
     verify_results: list[dict[str, Any]] = []
-    for item in incoming.get("verify_tools") or []:
-        if isinstance(item, str):
-            command = item
-            args: list[str] = []
-        else:
-            command = str(item.get("command", ""))
-            args = [str(arg) for arg in item.get("args", [])]
-        try:
-            verify_results.append(run_safe_tool(command, args=args, cwd=cwd, timeout_s=int(incoming.get("timeout_s", 120))))
-        except Exception as exc:
-            verify_results.append({"command": command, "args": args, "error": str(exc)})
-    failed = bool(patch_result and patch_result["status"] != "ok") or any(result.get("returncode", 1) != 0 for result in verify_results)
     model_review = ""
     usage: dict[str, Any] = {}
+    metadata: dict[str, Any] = {"context_mode": incoming.get("context_mode", "fast"), "skills": [], "repo_context": None}
+    failed = False
+    current_patch = str(incoming.get("patch", "")).strip()
+    current_apply = bool(incoming.get("apply", False))
+    attempt = 0
+    for attempt in range(1, max_attempts + 1):
+        patch_result = None
+        verify_results = []
+        if current_patch:
+            patch_result = check_or_apply_patch(cwd, current_patch, title, current_apply)
+        for item in incoming.get("verify_tools") or []:
+            if isinstance(item, str):
+                command = item
+                args: list[str] = []
+            else:
+                command = str(item.get("command", ""))
+                args = [str(arg) for arg in item.get("args", [])]
+            try:
+                verify_results.append(run_safe_tool(command, args=args, cwd=cwd, timeout_s=int(incoming.get("timeout_s", 120))))
+            except Exception as exc:
+                verify_results.append({"command": command, "args": args, "error": str(exc)})
+        failed = bool(patch_result and patch_result["status"] != "ok") or any(result.get("returncode", 1) != 0 for result in verify_results)
+        if not failed:
+            break
+        if auto_retry and attempt < max_attempts:
+            heal_prompt = (
+                "A coding loop attempt failed. Produce a corrected unified diff in a triple-backtick diff block. "
+                "Fix only what failed. Do not include any other text outside the diff block.\n\n"
+                f"Task: {incoming.get('task', '')}\n\n"
+                f"Failed patch result:\n{json.dumps(patch_result, indent=2)}\n\n"
+                f"Verify failures:\n{json.dumps(verify_results, indent=2)}"
+            )
+            heal_payload, metadata = enrich_messages(
+                {
+                    "messages": [{"role": "user", "content": heal_prompt}],
+                    "project_path": cwd,
+                    "skills": incoming.get("skills", []),
+                    "context_mode": incoming.get("context_mode", "fast"),
+                    "max_tokens": incoming.get("max_tokens", 512),
+                    "temperature": incoming.get("temperature", 0),
+                }
+            )
+            heal_raw = post_model(heal_payload)
+            heal_response_obj = chat_response(heal_raw)
+            heal_response = heal_response_obj["content"]
+            usage = heal_response_obj["usage"]
+            match = re.search(r"```diff\n(.*?)```", heal_response, re.DOTALL)
+            if match:
+                current_patch = match.group(1)
+                current_apply = True
+            else:
+                break
+        else:
+            break
     if failed or incoming.get("review", True):
         prompt = (
             "Review this coding loop evidence. If it failed, explain the likely fix and next retry. "
@@ -2542,8 +2785,6 @@ def coding_loop(incoming: dict[str, Any]) -> dict[str, Any]:
         response = chat_response(raw)
         model_review = response["content"]
         usage = response["usage"]
-    else:
-        metadata = {"context_mode": incoming.get("context_mode", "fast"), "skills": [], "repo_context": None}
     status = "failed" if failed else "passed"
     trace = write_trace(
         "coding_loop",
@@ -2558,6 +2799,9 @@ def coding_loop(incoming: dict[str, Any]) -> dict[str, Any]:
         "usage": usage,
         "metadata": metadata,
         "trace": str(trace),
+        "attempts": attempt,
+        "final_attempt": attempt,
+        "auto_retry": auto_retry,
     }
 
 
@@ -3082,6 +3326,92 @@ def chat_response(raw: dict[str, Any]) -> dict[str, Any]:
     return {"content": content, "usage": raw.get("usage", {}), "raw": raw}
 
 
+class _TokenBucket:
+    """Token-bucket rate limiter (per source IP)."""
+
+    RATE = float(os.environ.get("LOCAL_CODER_RATE_LIMIT", "60"))   # requests per minute
+    BURST = float(os.environ.get("LOCAL_CODER_RATE_BURST", "20"))   # max burst tokens
+
+    def __init__(self) -> None:
+        self._buckets: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def consume(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(ip)
+            if bucket is None:
+                self._buckets[ip] = [self.BURST - 1.0, now]
+                return True
+            tokens, last_time = bucket
+            elapsed = now - last_time
+            tokens = min(self.BURST, tokens + elapsed * (self.RATE / 60.0))
+            if tokens >= 1.0:
+                tokens -= 1.0
+                self._buckets[ip] = [tokens, now]
+                return True
+            self._buckets[ip] = [tokens, now]
+            return False
+
+
+_rate_limiter = _TokenBucket()
+
+
+class _SessionStore:
+    """Simple in-memory + on-disk session store for multi-turn chat."""
+
+    MAX_SESSIONS = 200
+    MAX_TURNS = 50
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, list[dict]] = {}
+        self._order: list[str] = []
+        self._lock = threading.Lock()
+        self.SESSIONS_DIR = WORKSPACE / "sessions"
+        self.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    def get(self, session_id: str) -> list[dict]:
+        """Return stored history for session_id (loads from disk if needed)."""
+        with self._lock:
+            if session_id not in self._sessions:
+                path = self.SESSIONS_DIR / f"{session_id}.json"
+                if path.exists():
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        self._sessions[session_id] = data
+                        self._order.append(session_id)
+                    except (json.JSONDecodeError, OSError):
+                        return []
+            return list(self._sessions.get(session_id, []))
+
+    def add(self, session_id: str, messages: list[dict]) -> None:
+        """Store the full conversation (trimmed to MAX_TURNS turns)."""
+        with self._lock:
+            trimmed = messages[-(self.MAX_TURNS * 2):]
+            self._sessions[session_id] = trimmed
+            if session_id not in self._order:
+                self._order.append(session_id)
+            self._persist(session_id, trimmed)
+            self._evict()
+
+    def _persist(self, session_id: str, messages: list[dict]) -> None:
+        path = self.SESSIONS_DIR / f"{session_id}.json"
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(messages, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except OSError:
+            pass
+
+    def _evict(self) -> None:
+        while len(self._sessions) > self.MAX_SESSIONS and self._order:
+            oldest = self._order.pop(0)
+            self._sessions.pop(oldest, None)
+
+
+_session_store = _SessionStore()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
@@ -3151,6 +3481,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._check_auth():
             self._send_json(401, {"error": "Unauthorized — set X-API-Key header matching LOCAL_CODER_API_KEY"})
+            return
+        if not _rate_limiter.consume(self.client_address[0]):
+            self._send_json(429, {"error": "Rate limit exceeded", "retry_after_seconds": 60})
             return
         if self.path == "/save":
             self.handle_save()
@@ -3237,11 +3570,38 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             incoming = json.loads(body)
+            session_id: str | None = incoming.get("session_id") or None
+            if session_id:
+                history = _session_store.get(session_id)
+                if history:
+                    incoming = dict(incoming)
+                    incoming["messages"] = history + list(incoming.get("messages", []))
             payload, metadata = enrich_messages(incoming)
-            raw = post_model(payload)
-            response = chat_response(raw)
-            trace = write_trace("chat", {"metadata": metadata, "usage": response["usage"]})
-            self._send_json(200, {**response, "metadata": metadata, "trace": str(trace)})
+            if incoming.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    for chunk in post_model_stream(payload):
+                        sse_line = f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                        self.wfile.write(sse_line.encode("utf-8"))
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (URLError, TimeoutError, OSError):
+                    pass
+            else:
+                raw = post_model(payload)
+                response = chat_response(raw)
+                if session_id:
+                    _session_store.add(
+                        session_id,
+                        list(incoming.get("messages", [])) + [{"role": "assistant", "content": response["content"]}],
+                    )
+                trace = write_trace("chat", {"metadata": metadata, "usage": response["usage"]})
+                self._send_json(200, {**response, "session_id": session_id, "metadata": metadata, "trace": str(trace)})
         except (ValueError, TypeError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError) as exc:
             self._send_json(500, {"error": str(exc)})
 
@@ -3250,16 +3610,48 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             incoming = json.loads(body)
+            session_id: str | None = incoming.get("session_id") or None
+            if session_id:
+                history = _session_store.get(session_id)
+                if history:
+                    incoming = dict(incoming)
+                    incoming["messages"] = history + list(incoming.get("messages", []))
             payload = dict(incoming)
             payload["model"] = str(payload.get("model") or MODEL)
-            payload["stream"] = False
+            want_stream = bool(incoming.get("stream"))
             if payload.get("skills") or payload.get("project_path") or payload.get("context_mode"):
                 payload, metadata = enrich_messages(payload)
             else:
                 metadata = {"context_mode": "raw-openai", "skills": [], "repo_context": None}
-            raw = post_model(payload)
-            trace = write_trace("openai_chat", {"metadata": metadata, "usage": raw.get("usage", {})})
-            self._send_json(200, {**raw, "local_coder_trace": str(trace), "local_coder_metadata": metadata})
+            if want_stream:
+                payload["stream"] = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    for chunk in post_model_stream(payload):
+                        sse_line = f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+                        self.wfile.write(sse_line.encode("utf-8"))
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (URLError, TimeoutError, OSError):
+                    pass
+            else:
+                payload["stream"] = False
+                raw = post_model(payload)
+                if session_id:
+                    _oai_choices = raw.get("choices", [])
+                    _oai_msg = _oai_choices[0].get("message", {}) if _oai_choices else {}
+                    _oai_content = _oai_msg.get("content", "")
+                    _session_store.add(
+                        session_id,
+                        list(incoming.get("messages", [])) + [{"role": "assistant", "content": _oai_content}],
+                    )
+                trace = write_trace("openai_chat", {"metadata": metadata, "usage": raw.get("usage", {})})
+                self._send_json(200, {**raw, "session_id": session_id, "local_coder_trace": str(trace), "local_coder_metadata": metadata})
         except (ValueError, TypeError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError) as exc:
             self._send_json(502, {"error": {"message": str(exc), "type": "upstream_error"}})
 
