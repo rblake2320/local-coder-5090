@@ -337,7 +337,8 @@ HTML = """<!doctype html>
       background: var(--danger);
       flex: 0 0 auto;
     }
-    .dot.ok { background: var(--accent-2); }
+    .dot.ok   { background: var(--accent-2); }
+    .dot.warn { background: #e3b341; }
     .messages {
       overflow: auto;
       padding: 20px 18px 26px;
@@ -635,17 +636,31 @@ HTML = """<!doctype html>
       try {
         const res = await fetch("/status");
         const data = await res.json();
-        const ok = data.health?.status === "ok";
-        els.dot.className = "dot" + (ok ? " ok" : "");
-        els.statusText.textContent = ok ? "Online" : "Offline";
-        els.sideStatus.textContent = ok ? "Qwen ready" : "Model unavailable";
+        const h = data.health || {};
+        const ollamaUp  = h.status === "ok";
+        const modelReady = ollamaUp && h.model_ready !== false;
+        const inVram    = ollamaUp && h.model_in_vram === true;
+        // Three states: green = ready, amber = server up but model not loaded, red = offline
+        if (modelReady) {
+          els.dot.className = "dot ok";
+          els.statusText.textContent = "Online";
+          els.sideStatus.textContent = inVram ? "Model in VRAM" : "Qwen ready";
+        } else if (ollamaUp) {
+          els.dot.className = "dot warn";
+          els.statusText.textContent = "Loading";
+          els.sideStatus.textContent = "Model not loaded — first request will load it";
+        } else {
+          els.dot.className = "dot";
+          els.statusText.textContent = "Offline";
+          els.sideStatus.textContent = h.error ? `Ollama error: ${h.error}` : "Ollama unreachable";
+        }
         const ctx = data.model?.meta?.n_ctx_train ? `${data.model.meta.n_ctx_train.toLocaleString()} ctx` : "262144 ctx";
         els.modelMeta.textContent = `${model} | ${ctx}`;
         if (data.workspace) els.workspaceStatus.textContent = `Workspace: ${data.workspace}`;
       } catch {
         els.dot.className = "dot";
         els.statusText.textContent = "Offline";
-        els.sideStatus.textContent = "Model unavailable";
+        els.sideStatus.textContent = "Server unreachable";
       }
     }
     function selectedSkillIds() {
@@ -4242,17 +4257,28 @@ def status_payload() -> dict[str, Any]:
         "workspace": str(WORKSPACE),
         "interfaces": provider_manifest()["interfaces"],
     }
-    # Ollama health: /api/tags returns loaded models
+    # Ollama health: /api/tags = downloaded models; /api/ps = models active in VRAM
     try:
         tags = get_json(f"{MODEL_BASE}/api/tags", timeout=3)
-        running = [m["name"] for m in (tags.get("models") or [])]
+        downloaded = [m["name"] for m in (tags.get("models") or [])]
+        model_ready = MODEL in downloaded or any(MODEL.split(":")[0] in r for r in downloaded)
+        # Check which models are actually loaded into VRAM right now
+        try:
+            ps = get_json(f"{MODEL_BASE}/api/ps", timeout=3)
+            vram_models = [m["name"] for m in (ps.get("models") or [])]
+            model_in_vram = MODEL in vram_models or any(MODEL.split(":")[0] in r for r in vram_models)
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+            vram_models = []
+            model_in_vram = False
         payload["health"] = {
             "status": "ok",
-            "models_loaded": running,
-            "model_ready": MODEL in running or any(MODEL.split(":")[0] in r for r in running),
+            "models_downloaded": downloaded,
+            "model_ready": model_ready,
+            "model_in_vram": model_in_vram,
+            "vram_models": vram_models,
         }
     except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        payload["health"] = {"status": "error", "error": str(exc)}
+        payload["health"] = {"status": "error", "error": str(exc), "model_ready": False, "model_in_vram": False}
     try:
         models = get_json(f"{MODEL_BASE}/v1/models")
         data = models.get("data") or []
