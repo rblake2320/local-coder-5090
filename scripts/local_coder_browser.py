@@ -567,6 +567,70 @@ HTML = """<!doctype html>
             <label>Upload folder <input id="folderUpload" type="file" multiple webkitdirectory></label>
             <button id="uploadFiles" type="button">Upload</button>
             <button id="dockerMcpTools" type="button">Docker MCP</button>
+            <button id="instructionsBtn" type="button" title="Edit LOCALCODER.md instructions for the project or global">Instructions</button>
+            <button id="kbBtn" type="button" title="Browse and edit knowledge base files">Knowledge Base</button>
+            <button id="mcpConfigBtn" type="button" title="Configure external MCP servers (mcp-servers.json)">MCP Config</button>
+          </div>
+
+          <!-- Instructions modal -->
+          <div id="instructionsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
+            <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(700px,95vw);max-height:80vh;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <strong>Instructions</strong>
+                <div style="display:flex;gap:8px;">
+                  <select id="instScope" style="min-height:28px;padding:2px 6px;">
+                    <option value="project">Project (LOCALCODER.md)</option>
+                    <option value="global">Global (~/.localcoder/global.md)</option>
+                  </select>
+                  <button id="instClose" type="button" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:18px;">✕</button>
+                </div>
+              </div>
+              <div style="font-size:11px;color:#8b949e;" id="instPathLabel"></div>
+              <textarea id="instContent" style="flex:1;min-height:320px;font-family:monospace;font-size:13px;background:#0f141b;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:10px;resize:vertical;" placeholder="Write instructions in markdown. These are injected into every system prompt for this project.&#10;&#10;Examples:&#10;- Always use TypeScript strict mode&#10;- API base URL is https://api.example.com&#10;- Never modify src/auth/&#10;- Prefer functional components in React"></textarea>
+              <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="instSave" type="button" class="primary">Save</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Knowledge Base modal -->
+          <div id="kbModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
+            <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(700px,95vw);max-height:80vh;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <strong>Knowledge Base</strong>
+                <button id="kbClose" type="button" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:18px;">✕</button>
+              </div>
+              <div style="font-size:11px;color:#8b949e;">Files in kb/ are keyword-matched against your query and injected as context. Supports .md .txt .rst .json</div>
+              <div id="kbFileList" style="flex:1;overflow-y:auto;min-height:100px;background:#0f141b;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:12px;"></div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <select id="kbScope" style="min-height:28px;padding:2px 6px;">
+                  <option value="global">Global (~/.localcoder/kb/)</option>
+                  <option value="project">Project (project/kb/)</option>
+                </select>
+                <input id="kbFilename" type="text" placeholder="filename.md" style="flex:1;">
+              </div>
+              <textarea id="kbContent" style="min-height:180px;font-family:monospace;font-size:13px;background:#0f141b;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:10px;resize:vertical;" placeholder="Paste doc, spec, runbook, or any reference material here."></textarea>
+              <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="kbSave" type="button" class="primary">Save file</button>
+                <button id="kbRefresh" type="button">Refresh list</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- MCP Config modal -->
+          <div id="mcpConfigModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
+            <div style="background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:20px;width:min(700px,95vw);max-height:80vh;display:flex;flex-direction:column;gap:10px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <strong>MCP Servers Config</strong>
+                <button id="mcpConfigClose" type="button" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:18px;">✕</button>
+              </div>
+              <div style="font-size:11px;color:#8b949e;" id="mcpConfigPath"></div>
+              <div style="font-size:11px;color:#8b949e;">Standard Claude Desktop mcpServers format. Configured servers are listed in every system prompt.</div>
+              <textarea id="mcpConfigContent" style="flex:1;min-height:320px;font-family:monospace;font-size:13px;background:#0f141b;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:10px;resize:vertical;" placeholder='{"mcpServers": {"my-server": {"url": "http://localhost:9000", "description": "My custom MCP server"}}}'></textarea>
+              <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="mcpConfigSave" type="button" class="primary">Save</button>
+              </div>
+            </div>
           </div>
           <div id="usage" class="usage"></div>
         </div>
@@ -603,7 +667,10 @@ HTML = """<!doctype html>
       uploadFiles: document.getElementById("uploadFiles"),
       dockerMcpTools: document.getElementById("dockerMcpTools"),
       workspaceStatus: document.getElementById("workspaceStatus"),
-      usage: document.getElementById("usage")
+      usage: document.getElementById("usage"),
+      instructionsBtn: document.getElementById("instructionsBtn"),
+      kbBtn: document.getElementById("kbBtn"),
+      mcpConfigBtn: document.getElementById("mcpConfigBtn")
     };
     let state = loadState();
 
@@ -918,6 +985,105 @@ HTML = """<!doctype html>
         els.dockerMcpTools.disabled = false;
       }
     }
+    // ── Instructions modal ───────────────────────────────────────────────────
+    const instModal = document.getElementById("instructionsModal");
+    document.getElementById("instClose").onclick = () => instModal.style.display = "none";
+    document.getElementById("instScope").onchange = loadInstructions;
+    async function loadInstructions() {
+      const proj = els.projectPath.value.trim();
+      const scope = document.getElementById("instScope").value;
+      const label = document.getElementById("instPathLabel");
+      try {
+        const res = await fetch(`/instructions?project_path=${encodeURIComponent(proj)}`);
+        const data = await res.json();
+        document.getElementById("instContent").value = scope === "global" ? data.global : data.project;
+        label.textContent = scope === "global" ? data.global_path : (data.project_path || "(no project path set)");
+      } catch (e) { label.textContent = "Error loading: " + e.message; }
+    }
+    els.instructionsBtn.onclick = async () => {
+      instModal.style.display = "flex";
+      await loadInstructions();
+    };
+    document.getElementById("instSave").onclick = async () => {
+      const scope = document.getElementById("instScope").value;
+      const content = document.getElementById("instContent").value;
+      const proj = els.projectPath.value.trim();
+      try {
+        const res = await fetch("/instructions", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({scope, content, project_path: proj})
+        });
+        const data = await res.json();
+        els.usage.textContent = data.error ? `Save failed: ${data.error}` : `Instructions saved → ${data.saved}`;
+        if (!data.error) instModal.style.display = "none";
+      } catch (e) { els.usage.textContent = "Save error: " + e.message; }
+    };
+
+    // ── Knowledge Base modal ─────────────────────────────────────────────────
+    const kbModal = document.getElementById("kbModal");
+    document.getElementById("kbClose").onclick = () => kbModal.style.display = "none";
+    async function loadKbFiles() {
+      const proj = els.projectPath.value.trim();
+      const listEl = document.getElementById("kbFileList");
+      try {
+        const res = await fetch(`/kb?project_path=${encodeURIComponent(proj)}`);
+        const data = await res.json();
+        if (!data.files.length) { listEl.textContent = "(no files yet)"; return; }
+        listEl.innerHTML = data.files.map(f =>
+          `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d;">
+            <span title="${f.path}"><b>${f.scope}</b>/${f.name} <span style="color:#8b949e;">(${(f.size/1024).toFixed(1)}KB)</span></span>
+            <button type="button" style="font-size:11px;padding:1px 6px;" data-path="${f.path}" data-proj="${proj}" class="kb-del-btn">Delete</button>
+          </div>`
+        ).join("");
+        listEl.querySelectorAll(".kb-del-btn").forEach(btn => {
+          btn.onclick = async () => {
+            await fetch("/kb/delete", {method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({path: btn.dataset.path, project_path: btn.dataset.proj})});
+            loadKbFiles();
+          };
+        });
+      } catch (e) { listEl.textContent = "Error: " + e.message; }
+    }
+    els.kbBtn.onclick = () => { kbModal.style.display = "flex"; loadKbFiles(); };
+    document.getElementById("kbRefresh").onclick = loadKbFiles;
+    document.getElementById("kbSave").onclick = async () => {
+      const filename = document.getElementById("kbFilename").value.trim() || "untitled.md";
+      const content = document.getElementById("kbContent").value;
+      const scope = document.getElementById("kbScope").value;
+      const proj = els.projectPath.value.trim();
+      try {
+        const res = await fetch("/kb/save", {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({filename, content, scope, project_path: proj})});
+        const data = await res.json();
+        els.usage.textContent = data.error ? `KB save failed: ${data.error}` : `Saved → ${data.saved}`;
+        if (!data.error) { document.getElementById("kbContent").value = ""; document.getElementById("kbFilename").value = ""; loadKbFiles(); }
+      } catch (e) { els.usage.textContent = "KB save error: " + e.message; }
+    };
+
+    // ── MCP Config modal ─────────────────────────────────────────────────────
+    const mcpModal = document.getElementById("mcpConfigModal");
+    document.getElementById("mcpConfigClose").onclick = () => mcpModal.style.display = "none";
+    els.mcpConfigBtn.onclick = async () => {
+      mcpModal.style.display = "flex";
+      try {
+        const res = await fetch("/mcp/config");
+        const data = await res.json();
+        document.getElementById("mcpConfigContent").value = JSON.stringify(data.config || {}, null, 2);
+        document.getElementById("mcpConfigPath").textContent = data.path || "";
+      } catch (e) { document.getElementById("mcpConfigContent").value = "// Error loading: " + e.message; }
+    };
+    document.getElementById("mcpConfigSave").onclick = async () => {
+      try {
+        const raw = document.getElementById("mcpConfigContent").value;
+        const config = JSON.parse(raw);
+        const res = await fetch("/mcp/config", {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({config})});
+        const data = await res.json();
+        els.usage.textContent = data.error ? `MCP config save failed: ${data.error}` : `MCP config saved → ${data.saved}`;
+        if (!data.error) mcpModal.style.display = "none";
+      } catch (e) { els.usage.textContent = "MCP config save error: " + e.message; }
+    };
+
     els.form.addEventListener("submit", sendPrompt);
     els.newChat.addEventListener("click", newChat);
     els.saveLast.addEventListener("click", saveLastResponse);
@@ -3280,6 +3446,109 @@ def docker_mcp_call(incoming: dict[str, Any], timeout_s: int = 60) -> dict[str, 
     return payload
 
 
+def load_instructions(project_path: str | None) -> list[str]:
+    """Load global + project-level instruction files into system prompt."""
+    parts: list[str] = []
+    global_inst = Path.home() / ".localcoder" / "global.md"
+    if global_inst.exists():
+        try:
+            text = global_inst.read_text(encoding="utf-8").strip()
+            if text:
+                parts.append(f"## Global Instructions\n{text}")
+        except OSError:
+            pass
+    if project_path:
+        for name in ("LOCALCODER.md", ".localcoder.md"):
+            proj_inst = Path(project_path) / name
+            if proj_inst.exists():
+                try:
+                    text = proj_inst.read_text(encoding="utf-8").strip()
+                    if text:
+                        parts.append(f"## Project Instructions ({name})\n{text}")
+                except OSError:
+                    pass
+                break
+    return parts
+
+
+def search_kb(project_path: str | None, query: str, max_files: int = 5, max_chars: int = 4000) -> list[str]:
+    """Keyword-score kb/ folders and return excerpts from matching files."""
+    kb_dirs = [Path.home() / ".localcoder" / "kb"]
+    if project_path:
+        kb_dirs.append(Path(project_path) / "kb")
+
+    query_words = {w.lower() for w in re.split(r'\W+', query) if len(w) > 3}
+    if not query_words:
+        return []
+
+    candidates: list[tuple[int, Path]] = []
+    for kb_dir in kb_dirs:
+        if not kb_dir.exists():
+            continue
+        for fpath in sorted(kb_dir.rglob("*")):
+            if not fpath.is_file() or fpath.suffix.lower() not in {".md", ".txt", ".rst", ".json"}:
+                continue
+            name_words = {w.lower() for w in re.split(r'\W+', fpath.stem) if len(w) > 2}
+            try:
+                snippet = fpath.read_text(encoding="utf-8", errors="replace")[:500].lower()
+            except OSError:
+                continue
+            score = len(query_words & name_words) * 3 + sum(1 for w in query_words if w in snippet)
+            if score > 0:
+                candidates.append((score, fpath))
+
+    candidates.sort(key=lambda x: -x[0])
+    results: list[str] = []
+    total_chars = 0
+    for _, fpath in candidates[:max_files]:
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+            remaining = max_chars - total_chars
+            if remaining <= 0:
+                break
+            excerpt = content[:remaining]
+            results.append(f"### KB: {fpath.name}\n{excerpt}")
+            total_chars += len(excerpt)
+        except OSError:
+            continue
+    return results
+
+
+def search_memoryweb(query: str, k: int = 5) -> list[str]:
+    """Search MemoryWeb at localhost:8100 for relevant memories."""
+    try:
+        payload = json.dumps({"query": query, "k": k}).encode("utf-8")
+        req = Request(
+            "http://localhost:8100/api/search",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        memories = data.get("results") or data.get("memories") or []
+        snippets: list[str] = []
+        for mem in memories[:k]:
+            text = str(mem.get("content") or mem.get("text") or mem.get("body") or "")
+            title = str(mem.get("title") or mem.get("name") or "")
+            if text:
+                snippets.append(f"[{title}] {text[:300]}" if title else text[:300])
+        return snippets
+    except Exception:
+        return []
+
+
+def load_mcp_servers_config() -> dict[str, Any]:
+    """Load user-configured external MCP servers from workspace/mcp-servers.json."""
+    config_path = WORKSPACE / "mcp-servers.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
 def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     mode = str(incoming.get("context_mode") or "fast")
     mode_config = CONTEXT_MODES.get(mode, CONTEXT_MODES["fast"])
@@ -3291,6 +3560,10 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     skill_context = build_skill_context(selected_skills)
     repo_context = compile_repo_context(incoming.get("project_path"), user_text, mode) if incoming.get("project_path") else None
     memory = load_project_memory(incoming.get("project_path"))
+    instructions = load_instructions(incoming.get("project_path"))
+    kb_results = search_kb(incoming.get("project_path"), user_text)
+    memoryweb_hits = search_memoryweb(user_text) if len(user_text.strip()) > 20 else []
+    mcp_servers_cfg = load_mcp_servers_config()
     system_parts = [
         "You are Local Coder, a durable local coding agent. Be direct, evidence-first, and prefer concrete file/command references.\n\n"
         "## What you can already do (built-in tools — use them freely):\n"
@@ -3330,6 +3603,22 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         system_parts.append(skill_context)
     if memory and any(memory.get(key) for key in ("notes", "commands", "services", "ports", "do_not_touch")):
         system_parts.append("Project memory:\n" + json.dumps(memory, indent=2, sort_keys=True))
+    # Instructions (LOCALCODER.md + ~/.localcoder/global.md)
+    for inst_block in instructions:
+        system_parts.append(inst_block)
+    # Knowledge base excerpts (kb/ folder, keyword-matched)
+    if kb_results:
+        system_parts.append("## Knowledge Base\n" + "\n\n".join(kb_results))
+    # MemoryWeb semantic recall
+    if memoryweb_hits:
+        system_parts.append("## Relevant Memories\n" + "\n".join(f"- {h}" for h in memoryweb_hits))
+    # External MCP servers config
+    if mcp_servers_cfg.get("mcpServers"):
+        server_list = "\n".join(
+            f"  - {name}: {cfg.get('description') or cfg.get('url') or cfg.get('command', '')}"
+            for name, cfg in mcp_servers_cfg["mcpServers"].items()
+        )
+        system_parts.append(f"## Configured MCP Servers\n{server_list}")
     if repo_context and repo_context["context"]:
         system_parts.append(repo_context["context"])
     enriched = [{"role": "system", "content": "\n\n".join(system_parts)}, *messages]
@@ -3338,6 +3627,10 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "skills": [{"id": skill["id"], "name": skill["name"], "truncated": skill["truncated"]} for skill in selected_skills],
         "repo_context": None if repo_context is None else {key: value for key, value in repo_context.items() if key != "context"},
         "memory_path": str(project_memory_path(incoming.get("project_path"))),
+        "instructions_loaded": len(instructions),
+        "kb_files": len(kb_results),
+        "memoryweb_hits": len(memoryweb_hits),
+        "mcp_servers": list(mcp_servers_cfg.get("mcpServers", {}).keys()),
     }
     model = str(incoming.get("model") or MODEL)
     requested_tokens = int(incoming.get("max_tokens", mode_config["max_tokens"]))
@@ -4222,6 +4515,39 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/docker-mcp/catalog":
             self._send_json(200, docker_mcp_catalog())
             return
+        if self.path.startswith("/instructions"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            proj = (qs.get("project_path") or [""])[0]
+            global_path = Path.home() / ".localcoder" / "global.md"
+            proj_path = (Path(proj) / "LOCALCODER.md") if proj else None
+            global_text = global_path.read_text(encoding="utf-8") if global_path.exists() else ""
+            proj_text = proj_path.read_text(encoding="utf-8") if proj_path and proj_path.exists() else ""
+            self._send_json(200, {"global": global_text, "project": proj_text,
+                                  "global_path": str(global_path),
+                                  "project_path": str(proj_path) if proj_path else ""})
+            return
+        if self.path.startswith("/kb"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            proj = (qs.get("project_path") or [""])[0]
+            kb_dirs = [Path.home() / ".localcoder" / "kb"]
+            if proj:
+                kb_dirs.append(Path(proj) / "kb")
+            files: list[dict[str, Any]] = []
+            for kb_dir in kb_dirs:
+                if kb_dir.exists():
+                    for f in sorted(kb_dir.rglob("*")):
+                        if f.is_file():
+                            files.append({"name": f.name, "path": str(f),
+                                          "size": f.stat().st_size,
+                                          "scope": "global" if str(kb_dir) == str(Path.home() / ".localcoder" / "kb") else "project"})
+            self._send_json(200, {"files": files})
+            return
+        if self.path == "/mcp/config":
+            cfg = load_mcp_servers_config()
+            self._send_json(200, {"config": cfg, "path": str(WORKSPACE / "mcp-servers.json")})
+            return
         if self.path == "/v1/models":
             try:
                 self._send_json(200, get_json(f"{MODEL_BASE}/v1/models"))
@@ -4259,6 +4585,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/settings":
             self.handle_settings()
+            return
+        if self.path == "/instructions":
+            self.handle_instructions_save()
+            return
+        if self.path == "/kb/save":
+            self.handle_kb_save()
+            return
+        if self.path == "/kb/delete":
+            self.handle_kb_delete()
+            return
+        if self.path == "/mcp/config":
+            self.handle_mcp_config_save()
             return
         if self.path == "/save":
             self.handle_save()
@@ -4464,6 +4802,75 @@ class Handler(BaseHTTPRequestHandler):
             existing.update(incoming)
             settings_path.write_text(json.dumps(existing, indent=2))
             self._send_json(200, existing)
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def handle_instructions_save(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            scope = str(body.get("scope") or "project")
+            content = str(body.get("content") or "")
+            project_path = str(body.get("project_path") or "")
+            if scope == "global":
+                dest = Path.home() / ".localcoder" / "global.md"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                if not project_path:
+                    self._send_json(400, {"error": "project_path required for project scope"})
+                    return
+                dest = Path(project_path) / "LOCALCODER.md"
+            dest.write_text(content, encoding="utf-8")
+            self._send_json(200, {"saved": str(dest), "bytes": len(content)})
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def handle_kb_save(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            filename = safe_relative_path(str(body.get("filename") or "untitled.md")).name
+            content = str(body.get("content") or "")
+            scope = str(body.get("scope") or "global")
+            project_path = str(body.get("project_path") or "")
+            if scope == "project" and project_path:
+                kb_dir = Path(project_path) / "kb"
+            else:
+                kb_dir = Path.home() / ".localcoder" / "kb"
+            kb_dir.mkdir(parents=True, exist_ok=True)
+            dest = kb_dir / filename
+            dest.write_text(content, encoding="utf-8")
+            self._send_json(200, {"saved": str(dest), "bytes": len(content)})
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def handle_kb_delete(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            target = Path(str(body.get("path") or ""))
+            # Safety: must be inside a known kb dir
+            allowed_roots = [Path.home() / ".localcoder" / "kb"]
+            proj = str(body.get("project_path") or "")
+            if proj:
+                allowed_roots.append(Path(proj) / "kb")
+            if not any(str(target).startswith(str(r)) for r in allowed_roots):
+                self._send_json(400, {"error": "path not in a known kb directory"})
+                return
+            if target.exists() and target.is_file():
+                target.unlink()
+            self._send_json(200, {"deleted": str(target)})
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def handle_mcp_config_save(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            config = body.get("config") or body
+            config_path = WORKSPACE / "mcp-servers.json"
+            config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._send_json(200, {"saved": str(config_path)})
         except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
             self._send_json(400, {"error": str(exc)})
 
