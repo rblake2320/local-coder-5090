@@ -119,9 +119,18 @@ SAFE_TOOL_COMMANDS = {
     "rg",
     "git_status",
     "git_diff",
+    "git_commit",
+    "git_push",
     "pytest",
     "py_compile",
+    "py_debug",
+    "cprofile",
     "where",
+    "bandit",
+    "mem_profile",
+    "docker_run",
+    "psql_query",
+    "gh_workflow",
 }
 TEXT_FILE_SUFFIXES = {
     ".py",
@@ -151,7 +160,11 @@ ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 MAX_REQUEST_BODY = 50 * 1024 * 1024  # 50 MB cap for non-upload POST bodies
-DOCKER_MCP_DEFAULT_ALLOWED = {"mcp-find"}
+DOCKER_MCP_DEFAULT_ALLOWED = {
+    "mcp-find", "mcp-add", "mcp-remove", "mcp-exec",
+    "mcp-activate-profile", "mcp-create-profile", "mcp-config-set",
+    "code-mode", "fetch", "get_current_time", "convert_time",
+}
 DAILY_CONTROL = AI_BUSINESS / "ops" / "daily_control_win.py"
 PROCESS_REGISTRY = AI_BUSINESS / "processes" / "registry.json"
 PROCESS_DOC = AI_BUSINESS / "PROCESS.md"
@@ -825,11 +838,18 @@ HTML = """<!doctype html>
     }
     async function showDockerMcpTools() {
       els.dockerMcpTools.disabled = true;
+      els.usage.textContent = "Querying Docker MCP…";
       try {
-        const res = await fetch("/docker-mcp/tools");
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-        els.usage.textContent = `Docker MCP: ${data.tool_count || 0} tools, allowed calls: ${(data.allowed_call_tools || []).join(", ") || "none"}`;
+        const [toolsRes, catRes] = await Promise.all([
+          fetch("/docker-mcp/tools"),
+          fetch("/docker-mcp/catalog"),
+        ]);
+        const tools = await toolsRes.json();
+        const cat = await catRes.json();
+        if (!toolsRes.ok || tools.error) throw new Error(tools.error || `HTTP ${toolsRes.status}`);
+        const catalogCount = cat.server_count || "?";
+        const enabledCount = tools.tool_count || 0;
+        els.usage.textContent = `Docker MCP: ${enabledCount} tools active | ${catalogCount} servers in catalog | allowed: ${(tools.allowed_call_tools || []).join(", ") || "none"}`;
       } catch (err) {
         els.usage.textContent = `Docker MCP failed: ${err.message || err}`;
       } finally {
@@ -883,6 +903,7 @@ PALETTE_HTML = """<!doctype html>
     <button data-get="/mcp/manifest">MCP Manifest</button>
     <button data-get="/a2a/agents">A2A Agents</button>
     <button data-get="/docker-mcp/tools">Docker MCP Tools</button>
+    <button data-get="/docker-mcp/catalog">Docker MCP Catalog (311)</button>
     <button data-post="/web/search" data-body='{"query":"Model Context Protocol tool security best practices","limit":3}'>Web Search</button>
     <button data-post="/skills/create" data-body='{"name":"example-local-coder-skill","description":"Draft example skill for Local Coder growth.","instructions":"Use this only as a draft smoke test.","apply":false}'>Draft Skill</button>
     <button data-post="/mcp/request" data-body='{"server":"github","reason":"example request from palette","discover":true}'>Request MCP</button>
@@ -1579,6 +1600,121 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
     elif command in {"dir", "where"}:
         safe_args = [a for a in args[:4] if not a.startswith("/") or a.startswith("/b")]
         cmd = [command, *safe_args]
+    elif command == "cprofile":
+        # argv[0] = script to profile; argv[1:] = script args
+        safe_argv = [sys.executable, "-m", "cProfile", "-s", "cumulative"] + (args or [])
+        result = subprocess.run(safe_argv, capture_output=True, text=True,
+                                cwd=workdir, timeout=120)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode, "stdout": result.stdout,
+                "stderr": result.stderr}
+    elif command == "git_commit":
+        msg = args[0] if args else "Auto-commit from Local Coder"
+        r1 = subprocess.run(["git", "add", "-A"], capture_output=True, text=True,
+                             cwd=workdir, timeout=30)
+        r2 = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True,
+                             cwd=workdir, timeout=30)
+        write_trace("tool_run", {"command": command, "argv": args, "cwd": workdir,
+                                 "returncode": r2.returncode})
+        return {"command": command, "argv": args, "cwd": workdir,
+                "returncode": r2.returncode,
+                "stdout": r1.stdout + r2.stdout, "stderr": r1.stderr + r2.stderr}
+    elif command == "git_push":
+        result = subprocess.run(["git", "push"], capture_output=True, text=True,
+                                cwd=workdir, timeout=60)
+        write_trace("tool_run", {"command": command, "argv": args, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": args, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "py_debug":
+        # Run script with -W error and full traceback
+        safe_argv = [sys.executable, "-W", "error", "-tb"] + (args or [])
+        result = subprocess.run(safe_argv, capture_output=True, text=True,
+                                cwd=workdir, timeout=30)
+        write_trace("tool_run", {"command": command, "argv": safe_argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": safe_argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "bandit":
+        # argv[0] = path to scan; defaults to current dir
+        argv = args or []
+        target = argv[0] if argv else workdir
+        result = subprocess.run(
+            [sys.executable, "-m", "bandit", "-r", target, "-f", "text"],
+            capture_output=True, text=True, cwd=workdir, timeout=120
+        )
+        write_trace("tool_run", {"command": command, "argv": [target], "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": [target], "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "mem_profile":
+        # Uses tracemalloc (stdlib, no install needed)
+        argv = args or []
+        script = argv[0] if argv else ""
+        if not script:
+            return {"command": command, "argv": argv, "cwd": workdir,
+                    "returncode": 1, "stdout": "", "stderr": "No script specified"}
+        wrapper = (
+            "import tracemalloc, runpy, sys\n"
+            "tracemalloc.start()\n"
+            f"sys.argv = {repr(argv)}\n"
+            f"runpy.run_path({repr(script)}, run_name='__main__')\n"
+            "snap = tracemalloc.take_snapshot()\n"
+            "top = snap.statistics('lineno')[:20]\n"
+            "for s in top: print(s)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", wrapper],
+            capture_output=True, text=True, cwd=workdir, timeout=120
+        )
+        write_trace("tool_run", {"command": command, "argv": argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "docker_run":
+        # argv = full docker args e.g. ["run", "--rm", "python:3.12", "python", "-c", "print(1)"]
+        argv = args or []
+        result = subprocess.run(
+            ["docker"] + (argv or ["ps"]),
+            capture_output=True, text=True, cwd=workdir, timeout=120
+        )
+        write_trace("tool_run", {"command": command, "argv": argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "psql_query":
+        # argv[0] = connection string or db name, argv[1] = SQL query
+        argv = args or []
+        db = argv[0] if argv else "postgres"
+        sql = argv[1] if len(argv) > 1 else "SELECT version();"
+        result = subprocess.run(
+            ["psql", db, "-c", sql, "--no-password"],
+            capture_output=True, text=True, cwd=workdir, timeout=30
+        )
+        write_trace("tool_run", {"command": command, "argv": [db], "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
+    elif command == "gh_workflow":
+        # argv[0] = workflow name/file, argv[1:] = extra gh args
+        argv = args or []
+        result = subprocess.run(
+            ["gh", "workflow", "run"] + (argv or ["--help"]),
+            capture_output=True, text=True, cwd=workdir, timeout=60
+        )
+        write_trace("tool_run", {"command": command, "argv": argv, "cwd": workdir,
+                                 "returncode": result.returncode})
+        return {"command": command, "argv": argv, "cwd": workdir,
+                "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr}
     else:
         raise ValueError(f"tool not implemented: {command}")
     result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -2563,6 +2699,60 @@ def docker_mcp_tools(timeout_s: int = 30) -> dict[str, Any]:
     return payload
 
 
+def docker_mcp_catalog(timeout_s: int = 30) -> dict[str, Any]:
+    """List all servers available in the Docker MCP catalog (300+ entries)."""
+    catalog_ref = "mcp/docker-mcp-catalog:latest"
+    command = ["docker", "mcp", "catalog", "server", "list", catalog_ref]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "error": str(exc), "servers": [], "server_count": 0}
+    servers: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for line in result.stdout.splitlines():
+        # 2-space indent = server slug; 4-space indent = property; 0-indent = header
+        if not line.strip():
+            continue
+        if not line.startswith(" "):
+            # Top-level header line (Catalog:, Title:, Servers (...)) — skip
+            if current.get("name"):
+                servers.append(current)
+                current = {}
+            continue
+        if line.startswith("    "):
+            # Property line for current server
+            stripped = line.strip()
+            if stripped.startswith("Title:"):
+                current["title"] = stripped[len("Title:"):].strip()
+            elif stripped.startswith("Description:"):
+                current["description"] = stripped[len("Description:"):].strip()
+            elif stripped.startswith("Type:"):
+                current["type"] = stripped[len("Type:"):].strip()
+            elif stripped.startswith("Image:"):
+                current["image"] = stripped[len("Image:"):].strip()
+            elif stripped.startswith("Endpoint:"):
+                current["endpoint"] = stripped[len("Endpoint:"):].strip()
+            elif stripped.startswith("Tools:"):
+                try:
+                    current["tools"] = int(stripped[len("Tools:"):].strip())
+                except ValueError:
+                    pass
+        else:
+            # 2-space indent = new server slug
+            if current.get("name"):
+                servers.append(current)
+            current = {"name": line.strip()}
+    if current.get("name"):
+        servers.append(current)
+    return {
+        "available": result.returncode == 0,
+        "catalog": catalog_ref,
+        "server_count": len(servers),
+        "servers": servers,
+        "stderr_tail": result.stderr[-1000:],
+    }
+
+
 def docker_mcp_allowed_tools() -> set[str]:
     configured = os.environ.get("LOCAL_CODER_DOCKER_MCP_ALLOWED", "")
     if configured.strip():
@@ -2579,12 +2769,14 @@ def docker_mcp_call(incoming: dict[str, Any], timeout_s: int = 60) -> dict[str, 
         raise ValueError("arguments must be an object")
     argv = ["docker", "mcp", "tools", "call", name]
     for key, value in arguments.items():
-        if isinstance(value, (dict, list)):
-            raise ValueError("docker mcp bridge currently allows scalar key=value arguments only")
         # Security: reject flag-like keys that could inject CLI options
         if str(key).startswith("-"):
             raise ValueError(f"argument key '{key}' looks like a flag — not allowed")
-        argv.append(f"{key}={value}")
+        # Arrays and objects are JSON-serialized so docker mcp can parse them
+        if isinstance(value, (dict, list)):
+            argv.append(f"{key}={json.dumps(value)}")
+        else:
+            argv.append(f"{key}={value}")
     result = subprocess.run(argv, capture_output=True, text=True, timeout=min(timeout_s, 120), check=False)
     payload = {
         "name": name,
@@ -2609,7 +2801,30 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     repo_context = compile_repo_context(incoming.get("project_path"), user_text, mode) if incoming.get("project_path") else None
     memory = load_project_memory(incoming.get("project_path"))
     system_parts = [
-        "You are Local Coder, a durable local coding agent. Be direct, evidence-first, and prefer concrete file/command references.",
+        "You are Local Coder, a durable local coding agent. Be direct, evidence-first, and prefer concrete file/command references.\n\n"
+        "## What you can already do (built-in tools — use them freely):\n"
+        "- **web_search** – real-time internet search via 4 providers (Brave, Serper, DuckDuckGo, Wikipedia). You have live internet access.\n"
+        "- **web_fetch** – fetch any URL and return its text content (SSRF-protected).\n"
+        "- **File upload** – users can upload .py .js .ts .json .zip .tar.gz files for you to analyse.\n"
+        "- **Skills system** – your plugin/extensibility layer. Users can create and save custom skills via /skills. This IS your toolchain plugin system.\n"
+        "- **Git tools** – git_status and git_diff are available. git_commit and git_push are now also available.\n"
+        "- **Patch apply** – apply unified diffs with automatic file backup for easy rollback.\n"
+        "- **Project memory** – persistent key-value store per project path, survives server restarts.\n"
+        "- **Performance profiling** – cprofile command profiles any Python script.\n"
+        "- **Coding task loop** – /coding/task endpoint runs multi-step tasks with auto-retry.\n"
+        "- **MCP integration** – connect to external MCP tool servers for additional capabilities.\n"
+        "- **Provider fallback** – Ollama (local, you!) → AWS Bedrock → NVIDIA NIM.\n"
+        "- **Runtime** – you ARE the local LLM (qwen3:32b). You run on RTX 5090, 32 GB VRAM, 128 GB RAM. Zero cloud latency. Fully private.\n"
+        "- **OS** – Windows 11 with full tool access: pytest, rg, git, dir, where, py_compile.\n"
+        "- **Settings** – /settings GET/POST stores persistent JSON config in workspace/settings.json.\n"
+        "- **Security Auditing** – bandit tool scans Python for vulnerabilities.\n"
+        "- **Memory Profiling** – mem_profile tool uses tracemalloc for memory analysis.\n"
+        "- **Docker** – docker_run tool for container management (requires Docker Desktop).\n"
+        "- **Database** – psql_query tool for PostgreSQL queries.\n"
+        "- **CI/CD** – gh_workflow tool triggers GitHub Actions workflows.\n"
+        "- **Multi-language files** – upload and analyse Rust, Go, C++, Java, and any text-based source.\n"
+        "- **IDE bridge** – the /chat API is OpenAI-compatible; connect any IDE plugin that supports custom endpoints.\n"
+        "- **LoRA fine-tuning** – RTX 5090 + 128 GB RAM supports local fine-tuning workflows.",
         f"Context mode: {mode} ({mode_config['ctx']} tokens available on the running model).",
     ]
     if skill_context:
@@ -3484,11 +3699,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/context-modes":
             self._send_json(200, {"context_modes": CONTEXT_MODES})
             return
+        if self.path == "/settings":
+            settings_path = WORKSPACE / "settings.json"
+            data = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+            self._send_json(200, data)
+            return
         if self.path == "/commands":
             self._send_json(200, {"commands": command_palette()})
             return
         if self.path == "/docker-mcp/tools":
             self._send_json(200, docker_mcp_tools())
+            return
+        if self.path == "/docker-mcp/catalog":
+            self._send_json(200, docker_mcp_catalog())
             return
         if self.path == "/v1/models":
             try:
@@ -3524,6 +3747,9 @@ class Handler(BaseHTTPRequestHandler):
         _content_length = int(self.headers.get("Content-Length", "0"))
         if self.path not in _upload_paths and _content_length > MAX_REQUEST_BODY:
             self._send_json(413, {"error": f"Request body too large (max {MAX_REQUEST_BODY // 1024 // 1024} MB)"})
+            return
+        if self.path == "/settings":
+            self.handle_settings()
             return
         if self.path == "/save":
             self.handle_save()
@@ -3715,6 +3941,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {**raw, "session_id": session_id, "local_coder_trace": str(trace), "local_coder_metadata": metadata})
         except (ValueError, TypeError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError) as exc:
             self._send_json(502, {"error": {"message": str(exc), "type": "upstream_error"}})
+
+    def handle_settings(self) -> None:
+        settings_path = WORKSPACE / "settings.json"
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            incoming = json.loads(body) if body else {}
+            existing = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+            existing.update(incoming)
+            settings_path.write_text(json.dumps(existing, indent=2))
+            self._send_json(200, existing)
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            self._send_json(400, {"error": str(exc)})
 
     def handle_skill_read(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
