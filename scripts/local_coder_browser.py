@@ -94,6 +94,7 @@ MODEL_OPTIONS = [
     },
 ]
 _HOME = Path(os.environ.get("LOCAL_CODER_HOME", r"C:\Users\techai\local-coder"))
+_PROJECT_ROOT = Path(__file__).parent.parent  # repo root: local-coder-5090/
 WORKSPACE = Path(os.environ.get("LOCAL_CODER_WORKSPACE", str(_HOME / "workspace")))
 UPLOAD_DIR = WORKSPACE / "uploads"
 GENERATED_SKILL_ROOT = Path(os.environ.get("LOCAL_CODER_SKILL_GEN", str(Path.home() / ".codex" / "skills" / "local-coder-generated")))
@@ -497,7 +498,7 @@ HTML = """<!doctype html>
               <label><input id="keepContext" type="checkbox" checked> Context</label>
             </div>
             <div class="settings">
-              <label>Project <input id="projectPath" type="text" placeholder="C:/Users/techai/local-coder" style="width: 260px"></label>
+              <label>Project <input id="projectPath" type="text" placeholder="project path (optional)" style="width: 260px"></label>
               <label>Skills <input id="skills" type="text" placeholder="skill ids, comma-separated" style="width: 220px"></label>
             </div>
             <div>
@@ -675,8 +676,8 @@ HTML = """<!doctype html>
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             messages,
-            max_tokens: Number(els.maxTokens.value || 1024),
-            temperature: Number(els.temperature.value || 0),
+            max_tokens: Math.min(8192, Math.max(16, Number(els.maxTokens.value) || 1024)),
+            temperature: Math.min(2, Math.max(0, Number(els.temperature.value) || 0)),
             context_mode: els.contextMode.value,
             project_path: els.projectPath.value.trim(),
             skills: selectedSkillIds()
@@ -872,7 +873,7 @@ PALETTE_HTML = """<!doctype html>
     <button data-post="/model/switch" data-body='{"target":"qwen3-coder-next-daily","apply":false}'>Switch Model Dry Run</button>
     <button data-post="/memory/clean" data-body='{"project_path":"C:/Users/techai/local-coder"}'>Clean Project Memory</button>
     <button data-post="/route" data-body='{"prompt":"palette route check","context_mode":"fast"}'>Route Check</button>
-    <button data-post="/tools/run" data-body='{"command":"pwd","cwd":"C:/Users/techai/local-coder"}'>Run pwd</button>
+    <button data-post="/tools/run" data-body='{"command":"pwd","cwd":"C:/Users/techai/local-coder-5090"}'>Run pwd</button>
     <button data-post="/upload/file" data-body='{"filename":"palette-note.txt","content":"Palette upload smoke test"}'>Upload Smoke</button>
   </div>
   <pre id="out">Ready.</pre>
@@ -883,10 +884,15 @@ PALETTE_HTML = """<!doctype html>
       try { out.textContent = JSON.stringify(JSON.parse(text), null, 2); }
       catch { out.textContent = text; }
     }
-    document.querySelectorAll("[data-get]").forEach(b => b.onclick = async () => show(await fetch(b.dataset.get)));
-    document.querySelectorAll("[data-post]").forEach(b => b.onclick = async () => show(await fetch(b.dataset.post, {
-      method: "POST", headers: {"Content-Type": "application/json"}, body: b.dataset.body
-    })));
+    document.querySelectorAll("[data-get]").forEach(b => b.onclick = async () => {
+      const prev = b.textContent; b.disabled = true; b.textContent = prev + " …"; out.textContent = "Loading…";
+      try { show(await fetch(b.dataset.get)); } finally { b.disabled = false; b.textContent = prev; }
+    });
+    document.querySelectorAll("[data-post]").forEach(b => b.onclick = async () => {
+      const prev = b.textContent; b.disabled = true; b.textContent = prev + " …"; out.textContent = "Loading…";
+      try { show(await fetch(b.dataset.post, {method: "POST", headers: {"Content-Type": "application/json"}, body: b.dataset.body})); }
+      finally { b.disabled = false; b.textContent = prev; }
+    });
   </script>
 </body>
 </html>
@@ -1502,7 +1508,7 @@ def _assert_allowed_cwd(requested: str | None) -> str:
         for p in os.environ.get("LOCAL_CODER_ALLOWED_ROOTS", "").split(";")
         if p.strip()
     ]
-    allowed = [WORKSPACE, AI_BUSINESS, *env_extra]
+    allowed = [WORKSPACE, AI_BUSINESS, _PROJECT_ROOT, *env_extra]
     for root in allowed:
         try:
             resolved.relative_to(root)
@@ -1521,7 +1527,9 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
     args = args or []
     workdir = _assert_allowed_cwd(cwd)
     if command == "pwd":
-        cmd = ["pwd"]
+        # pwd doesn't exist as a native Windows command; return workdir directly
+        write_trace("tool_run", {"command": command, "argv": [], "cwd": workdir, "returncode": 0})
+        return {"command": command, "argv": [], "cwd": workdir, "returncode": 0, "stdout": workdir + "\n", "stderr": ""}
     elif command == "ls":
         # Strip flag-like args to prevent ls flag injection
         safe_args = [a for a in args[:4] if not a.startswith("-")]
@@ -1962,8 +1970,8 @@ def readiness_report() -> dict[str, Any]:
             "single-Spark GLM-5.2 local autostart",
         ],
         "verification": [
-            "python3 -m pytest tests/ops/test_local_coder_browser.py tests/ops/test_daily_control.py tests/ops/test_model_cleanup_audit.py",
-            "python3 scripts/audit_capabilities.py",
+            "python -m pytest tests/ops/test_local_coder_browser.py tests/ops/test_daily_control.py tests/ops/test_model_cleanup_audit.py",
+            "python scripts/audit_capabilities.py",
             "live /provider, /readiness, /mcp/tools checks",
         ],
     }
@@ -2159,7 +2167,7 @@ def daily_control(action: str) -> dict[str, Any]:
     if action not in CONTROL_ACTIONS:
         raise ValueError(f"control action not allowed: {action}")
     if action == "status":
-        argv = ["python", str(DAILY_CONTROL), "status"]
+        argv = [sys.executable, str(DAILY_CONTROL), "status"]
         timeout_s = 60
     elif action == "impact":
         argv = [sys.executable, str(DAILY_CONTROL), "impact"]
@@ -2185,6 +2193,7 @@ def daily_control(action: str) -> dict[str, Any]:
     elif action == "run-local-coder-tests":
         argv = [sys.executable, "-m", "pytest", "tests/ops/test_local_coder_browser.py"]
         timeout_s = 300
+        return run_command_with_trace(f"control_{action}", argv, cwd=_PROJECT_ROOT, timeout_s=timeout_s)
     else:
         raise ValueError(f"control action not implemented: {action}")
     return run_command_with_trace(f"control_{action}", argv, timeout_s=timeout_s)
@@ -3581,6 +3590,18 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             incoming = json.loads(body)
+            raw_tokens = incoming.get("max_tokens")
+            if raw_tokens is not None:
+                clamped = max(16, min(8192, int(raw_tokens)))
+                if clamped != int(raw_tokens):
+                    incoming = dict(incoming)
+                    incoming["max_tokens"] = clamped
+            raw_temp = incoming.get("temperature")
+            if raw_temp is not None:
+                clamped_t = max(0.0, min(2.0, float(raw_temp)))
+                if clamped_t != float(raw_temp):
+                    incoming = dict(incoming)
+                    incoming["temperature"] = clamped_t
             session_id: str | None = incoming.get("session_id") or None
             if session_id:
                 history = _session_store.get(session_id)
