@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "platform": "windows-rtx5090",
+  "backend": "ollama",
+  "services": {
+    "LocalCoder": {
+      "description": "Local Coder 5090 HTTP server on :8022",
+      "nssm_service": "LocalCoder",
+      "script": "C:/Users/techai/local-coder/scripts/local_coder_browser.py",
+      "port": 8022,
+      "managed_by": "nssm"
+    }
+  },
+  "models": {
+    "deepseek-r1:32b": {
+      "role": "primary",
+      "use_case": "coding + reasoning",
+      "vram_gb": 20,
+      "ollama_name": "deepseek-r1:32b",
+      "context_tokens": 131072,
+      "notes": "Pull: ollama pull deepseek-r1:32b"
+    },
+    "gemma3:latest": {
+      "role": "fast",
+      "use_case": "quick completions, tool calls",
+      "vram_gb": 7,
+      "ollama_name": "gemma3:latest",
+      "context_tokens": 32768,
+      "notes": "Pull: ollama pull gemma3"
+    },
+    "llama3.1:70b": {
+      "role": "heavy",
+      "use_case": "long-context analysis",
+      "vram_gb": 28,
+      "ollama_name": "llama3.1:70b",
+      "context_tokens": 131072,
+      "notes": "Pull: ollama pull llama3.1:70b"
+    }
+  },
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "health_endpoint": "/api/tags",
+    "chat_endpoint": "/v1/chat/completions"
+  }
+}

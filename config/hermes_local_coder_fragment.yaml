@@ -1,0 +1,20 @@
+# Hermes / AI Army integration fragment for Local Coder 5090
+# Source this into your hermes config to route coding tasks to the 5090
+
+local_coder_5090:
+  base_url: "http://127.0.0.1:8022"
+  model_base: "http://localhost:11434"
+  model: "deepseek-r1:32b"
+  fast_model: "gemma3:latest"
+  v1_url: "http://127.0.0.1:8022/v1"
+  chat_endpoint: "http://127.0.0.1:8022/chat"
+  capabilities:
+    - coding
+    - code_review
+    - patch_apply
+    - context_search
+    - tool_execution
+  context_modes:
+    fast: 32768
+    repo:  65536
+    deep: 131072
