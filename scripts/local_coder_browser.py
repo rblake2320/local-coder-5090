@@ -522,6 +522,13 @@ HTML = """<!doctype html>
               <a class="link-button" href="/palette" target="_blank">Palette</a>
               <button id="compileContext" type="button">Compile context</button>
               <button id="saveLast" type="button">Save last</button>
+              <select id="providerSelect" title="Force LLM backend (Auto = local-first)">
+                <option value="">Auto</option>
+                <option value="ollama">Ollama (local)</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="bedrock">Bedrock</option>
+                <option value="nim">NIM</option>
+              </select>
               <button id="send" class="primary" type="submit">Send</button>
             </div>
           </div>
@@ -558,6 +565,7 @@ HTML = """<!doctype html>
       projectPath: document.getElementById("projectPath"),
       skills: document.getElementById("skills"),
       skillList: document.getElementById("skillList"),
+      providerSelect: document.getElementById("providerSelect"),
       compileContext: document.getElementById("compileContext"),
       saveLast: document.getElementById("saveLast"),
       fileUpload: document.getElementById("fileUpload"),
@@ -640,15 +648,22 @@ HTML = """<!doctype html>
         const ollamaUp  = h.status === "ok";
         const modelReady = ollamaUp && h.model_ready !== false;
         const inVram    = ollamaUp && h.model_in_vram === true;
+        const vramModel = (h.vram_models || [])[0] || null;
         // Three states: green = ready, amber = server up but model not loaded, red = offline
         if (modelReady) {
           els.dot.className = "dot ok";
           els.statusText.textContent = "Online";
-          els.sideStatus.textContent = inVram ? "Model in VRAM" : "Qwen ready";
+          if (inVram) {
+            els.sideStatus.textContent = "Model in VRAM — hot";
+          } else if (vramModel) {
+            els.sideStatus.textContent = `${vramModel} in VRAM — will swap`;
+          } else {
+            els.sideStatus.textContent = "Qwen ready — cold start";
+          }
         } else if (ollamaUp) {
           els.dot.className = "dot warn";
           els.statusText.textContent = "Loading";
-          els.sideStatus.textContent = "Model not loaded — first request will load it";
+          els.sideStatus.textContent = "Model not downloaded — install via Ollama";
         } else {
           els.dot.className = "dot";
           els.statusText.textContent = "Offline";
@@ -723,7 +738,8 @@ HTML = """<!doctype html>
             temperature: Math.min(2, Math.max(0, Number(els.temperature.value) || 0)),
             context_mode: els.contextMode.value,
             project_path: els.projectPath.value.trim(),
-            skills: selectedSkillIds()
+            skills: selectedSkillIds(),
+            ...(els.providerSelect.value ? {force_backend: els.providerSelect.value} : {})
           })
         });
         const data = await res.json();
@@ -732,8 +748,9 @@ HTML = """<!doctype html>
         session.updated = Date.now();
         const u = data.usage || {};
         const elapsed = Math.floor((Date.now() - t0) / 1000);
+        const via = data.backend_used ? ` | via ${data.backend_used}` : "";
         els.usage.style.color = "";
-        els.usage.textContent = `prompt ${u.prompt_tokens ?? "-"} | output ${u.completion_tokens ?? "-"} | total ${u.total_tokens ?? "-"} | ${elapsed}s`;
+        els.usage.textContent = `prompt ${u.prompt_tokens ?? "-"} | output ${u.completion_tokens ?? "-"} | total ${u.total_tokens ?? "-"} | ${elapsed}s${via}`;
       } catch (err) {
         const elapsed = Math.floor((Date.now() - t0) / 1000);
         session.messages.push({role: "assistant", content: `Request failed: ${err.message || err}`});
@@ -994,13 +1011,17 @@ _cb = _CircuitBreaker()
 
 
 def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
-    """Route to FAST_MODEL or MODEL with Ollama -> Bedrock -> NIM fallback chain."""
+    """Route to FAST_MODEL or MODEL with Ollama -> OpenRouter -> Bedrock -> NIM fallback chain.
+
+    Pass force_backend='ollama'|'openrouter'|'bedrock'|'nim' in payload to skip auto-routing.
+    """
     model_to_use = FAST_MODEL if fast else MODEL
+    force_backend = payload.pop("force_backend", None)
     send_payload = {**payload, "model": model_to_use, "stream": False}
     last_exc: Exception | None = None
 
     # --- Backend 1: Ollama ---
-    if not _cb.is_open():
+    if force_backend in (None, "ollama") and not _cb.is_open():
         try:
             req = Request(
                 f"{MODEL_BASE}/v1/chat/completions",
@@ -1016,72 +1037,118 @@ def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
         except (URLError, TimeoutError, OSError) as exc:
             _cb.record_failure()
             last_exc = exc
+            if force_backend == "ollama":
+                raise RuntimeError("Ollama backend failed") from exc
 
-    # --- Backend 2: AWS Bedrock ---
-    try:
-        import boto3  # type: ignore[import]
-        bedrock_model_id = os.environ.get(
-            "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"
-        )
-        client = boto3.client("bedrock-runtime")
-        messages = send_payload.get("messages", [])
-        system_msgs = [m["content"] for m in messages if m.get("role") == "system"]
-        user_msgs = [m for m in messages if m.get("role") != "system"]
-        bedrock_body: dict[str, Any] = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": send_payload.get("max_tokens", 4096),
-            "messages": user_msgs,
-        }
-        if system_msgs:
-            bedrock_body["system"] = "\n".join(system_msgs)
-        br_response = client.invoke_model(
-            modelId=bedrock_model_id,
-            body=json.dumps(bedrock_body),
-            contentType="application/json",
-            accept="application/json",
-        )
-        br_result = json.loads(br_response["body"].read().decode("utf-8"))
-        result = {
-            "id": br_result.get("id", ""),
-            "object": "chat.completion",
-            "model": bedrock_model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": br_result.get("content", [{}])[0].get("text", ""),
-                    },
-                    "finish_reason": br_result.get("stop_reason", "stop"),
+    # --- Backend 2: OpenRouter ---
+    if force_backend in (None, "openrouter"):
+        try:
+            or_key = os.environ.get("OPENROUTER_API_KEY", "")
+            if or_key:
+                # Map local model names to OpenRouter equivalents
+                _OR_MODELS: dict[str, str] = {
+                    "qwen3:32b": "qwen/qwen3-32b",
+                    "qwen3:32b-gpu": "qwen/qwen3-32b",
+                    "gemma4:latest": "google/gemma-3-27b-it",
+                    "llama3.1:70b": "meta-llama/llama-3.1-70b-instruct",
                 }
-            ],
-            "usage": br_result.get("usage", {}),
-            "backend_used": "bedrock",
-        }
-        return result
-    except Exception as exc:  # noqa: BLE001
-        last_exc = exc
+                or_model = (
+                    payload.get("openrouter_model")
+                    or os.environ.get("OPENROUTER_MODEL")
+                    or _OR_MODELS.get(model_to_use, "qwen/qwen3-32b")
+                )
+                or_payload = {**send_payload, "model": or_model}
+                or_req = Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=json.dumps(or_payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {or_key}",
+                        "HTTP-Referer": "http://localhost:8022",
+                        "X-Title": "Local Coder 5090",
+                    },
+                    method="POST",
+                )
+                with urlopen(or_req, timeout=300) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                result["backend_used"] = "openrouter"
+                return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if force_backend == "openrouter":
+                raise RuntimeError("OpenRouter backend failed") from exc
 
-    # --- Backend 3: NIM ---
-    try:
-        nim_base = os.environ.get("NIM_BASE", "https://integrate.api.nvidia.com/v1")
-        nim_key = os.environ.get("NVIDIA_API_KEY", "")
-        nim_payload = {**send_payload}
-        nim_req = Request(
-            f"{nim_base}/chat/completions",
-            data=json.dumps(nim_payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {nim_key}",
-            },
-            method="POST",
-        )
-        with urlopen(nim_req, timeout=1800) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        result["backend_used"] = "nim"
-        return result
-    except Exception as exc:  # noqa: BLE001
-        last_exc = exc
+    # --- Backend 3: AWS Bedrock ---
+    if force_backend in (None, "bedrock"):
+        try:
+            import boto3  # type: ignore[import]
+            bedrock_model_id = os.environ.get(
+                "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"
+            )
+            client = boto3.client("bedrock-runtime")
+            messages = send_payload.get("messages", [])
+            system_msgs = [m["content"] for m in messages if m.get("role") == "system"]
+            user_msgs = [m for m in messages if m.get("role") != "system"]
+            bedrock_body: dict[str, Any] = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": send_payload.get("max_tokens", 4096),
+                "messages": user_msgs,
+            }
+            if system_msgs:
+                bedrock_body["system"] = "\n".join(system_msgs)
+            br_response = client.invoke_model(
+                modelId=bedrock_model_id,
+                body=json.dumps(bedrock_body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            br_result = json.loads(br_response["body"].read().decode("utf-8"))
+            result = {
+                "id": br_result.get("id", ""),
+                "object": "chat.completion",
+                "model": bedrock_model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": br_result.get("content", [{}])[0].get("text", ""),
+                        },
+                        "finish_reason": br_result.get("stop_reason", "stop"),
+                    }
+                ],
+                "usage": br_result.get("usage", {}),
+                "backend_used": "bedrock",
+            }
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if force_backend == "bedrock":
+                raise RuntimeError("Bedrock backend failed") from exc
+
+    # --- Backend 4: NIM ---
+    if force_backend in (None, "nim"):
+        try:
+            nim_base = os.environ.get("NIM_BASE", "https://integrate.api.nvidia.com/v1")
+            nim_key = os.environ.get("NVIDIA_API_KEY", "")
+            nim_payload = {**send_payload}
+            nim_req = Request(
+                f"{nim_base}/chat/completions",
+                data=json.dumps(nim_payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {nim_key}",
+                },
+                method="POST",
+            )
+            with urlopen(nim_req, timeout=1800) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            result["backend_used"] = "nim"
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if force_backend == "nim":
+                raise RuntimeError("NIM backend failed") from exc
 
     raise RuntimeError("All backends failed") from last_exc
 
@@ -2828,7 +2895,7 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "- **Performance profiling** – cprofile command profiles any Python script.\n"
         "- **Coding task loop** – /coding/task endpoint runs multi-step tasks with auto-retry.\n"
         "- **MCP integration** – connect to external MCP tool servers for additional capabilities.\n"
-        "- **Provider fallback** – Ollama (local, you!) → AWS Bedrock → NVIDIA NIM.\n"
+        "- **Provider fallback** – Ollama (local, you!) → OpenRouter (set OPENROUTER_API_KEY) → AWS Bedrock → NVIDIA NIM. UI dropdown lets users force any backend.\n"
         "- **Runtime** – you ARE the local LLM (qwen3:32b). You run on RTX 5090, 32 GB VRAM, 128 GB RAM. Zero cloud latency. Fully private.\n"
         "- **OS** – Windows 11 with full tool access: pytest, rg, git, dir, where, py_compile.\n"
         "- **Settings** – /settings GET/POST stores persistent JSON config in workspace/settings.json.\n"
@@ -3869,7 +3936,10 @@ class Handler(BaseHTTPRequestHandler):
                 if history:
                     incoming = dict(incoming)
                     incoming["messages"] = history + list(incoming.get("messages", []))
+            force_backend = incoming.get("force_backend")
             payload, metadata = enrich_messages(incoming)
+            if force_backend:
+                payload["force_backend"] = force_backend
             if incoming.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -3903,8 +3973,8 @@ class Handler(BaseHTTPRequestHandler):
                         list(incoming.get("messages", [])) + [{"role": "assistant", "content": response["content"]}],
                     )
                 trace = write_trace("chat", {"metadata": metadata, "usage": response["usage"]})
-                self._send_json(200, {**response, "session_id": session_id, "metadata": metadata, "trace": str(trace)})
-        except (ValueError, TypeError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError) as exc:
+                self._send_json(200, {**response, "backend_used": raw.get("backend_used", "ollama"), "session_id": session_id, "metadata": metadata, "trace": str(trace)})
+        except (ValueError, TypeError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
             self._send_json(500, {"error": str(exc)})
 
     def handle_openai_chat(self) -> None:
