@@ -666,7 +666,22 @@ HTML = """<!doctype html>
       session.updated = Date.now();
       els.prompt.value = "";
       els.send.disabled = true;
-      els.usage.textContent = "Working...";
+      const t0 = Date.now();
+      let _timer = setInterval(() => {
+        const s = Math.floor((Date.now() - t0) / 1000);
+        if (s >= 120) {
+          els.usage.style.color = "#f85149";
+          els.usage.textContent = `Working… ${s}s — very slow, model may be stuck`;
+        } else if (s >= 45) {
+          els.usage.style.color = "#e3b341";
+          els.usage.textContent = `Working… ${s}s — slow (thinking mode)`;
+        } else {
+          els.usage.style.color = "";
+          els.usage.textContent = `Working… ${s}s`;
+        }
+      }, 1000);
+      els.usage.style.color = "";
+      els.usage.textContent = "Working… 0s";
       saveState();
       render();
       try {
@@ -688,11 +703,16 @@ HTML = """<!doctype html>
         session.messages.push({role: "assistant", content: data.content || ""});
         session.updated = Date.now();
         const u = data.usage || {};
-        els.usage.textContent = `prompt ${u.prompt_tokens ?? "-"} | output ${u.completion_tokens ?? "-"} | total ${u.total_tokens ?? "-"}`;
+        const elapsed = Math.floor((Date.now() - t0) / 1000);
+        els.usage.style.color = "";
+        els.usage.textContent = `prompt ${u.prompt_tokens ?? "-"} | output ${u.completion_tokens ?? "-"} | total ${u.total_tokens ?? "-"} | ${elapsed}s`;
       } catch (err) {
+        const elapsed = Math.floor((Date.now() - t0) / 1000);
         session.messages.push({role: "assistant", content: `Request failed: ${err.message || err}`});
-        els.usage.textContent = "Request failed";
+        els.usage.style.color = "#f85149";
+        els.usage.textContent = `Request failed (${elapsed}s)`;
       } finally {
+        clearInterval(_timer);
         els.send.disabled = false;
         saveState();
         render();
