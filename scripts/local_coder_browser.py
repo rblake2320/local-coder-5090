@@ -34,6 +34,8 @@ import subprocess
 import tarfile
 import threading
 import time
+import atexit
+import tempfile
 import webbrowser
 import zipfile
 from datetime import datetime, timezone
@@ -158,6 +160,14 @@ SAFE_TOOL_COMMANDS = {
     "sc_read",         # Read window text via UIA (zero-inference)
     "sc_click",        # Click at window-relative coordinates
     "sc_clipboard",    # Read or write the system clipboard
+    # Remote execution
+    "spark_exec",      # SSH command on Spark-1 or Spark-2
+    # System health
+    "chkdsk_report",   # Windows disk health via PowerShell Get-PhysicalDisk
+    # Load testing
+    "locust_run",      # HTTP load test via locust headless mode
+    # Discovery
+    "tool_search",     # Search available tools by keyword
     # Stubs (return helpful instructions when binary absent)
     "kubectl_get",     # Kubernetes — stub if kubectl not found
     "terraform_plan",  # Terraform plan — stub if tf not found
@@ -195,7 +205,7 @@ DOCKER_MCP_DEFAULT_ALLOWED = {
     "mcp-activate-profile", "mcp-create-profile", "mcp-config-set",
     "code-mode", "fetch", "get_current_time", "convert_time",
 }
-DAILY_CONTROL = AI_BUSINESS / "ops" / "daily_control_win.py"
+DAILY_CONTROL = _PROJECT_ROOT / "ops" / "daily_control_win.py"
 PROCESS_REGISTRY = AI_BUSINESS / "processes" / "registry.json"
 PROCESS_DOC = AI_BUSINESS / "PROCESS.md"
 MODEL_SERVICE_NAMES = {"OllamaService", "ollama", "LocalCoder", "qwen3-coder-next-daily"}
@@ -273,9 +283,13 @@ HTML = """<!doctype html>
     button:disabled { opacity: .55; cursor: wait; }
     .app {
       display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
+      grid-template-columns: 280px minmax(0, 1fr) 0px;
       height: 100vh;
       overflow: hidden;
+      transition: grid-template-columns 0.2s ease;
+    }
+    .app.panel-open {
+      grid-template-columns: 280px minmax(0, 1fr) 300px;
     }
     .sidebar {
       border-right: 1px solid var(--line);
@@ -316,6 +330,108 @@ HTML = """<!doctype html>
       padding: 10px 12px;
       color: var(--muted);
       font-size: 12px;
+    }
+    .settings-panel {
+      border-left: 1px solid var(--line);
+      background: #0b0f14;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .app.panel-open .settings-panel {
+      overflow-y: auto;
+    }
+    .panel-header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    .panel-header strong { font-size: 13px; }
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .panel-section {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .panel-section-title {
+      font-size: 10px;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: .06em;
+      margin-bottom: 2px;
+    }
+    .panel-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .panel-row label {
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .panel-row input[type="number"] { width: 72px; }
+    .panel-row input[type="text"], .panel-row select { width: 100%; }
+    .panel-btn {
+      width: 100%;
+      text-align: left;
+    }
+    .skill-chip {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 3px 6px;
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    .skill-chip input { min-height: unset; width: 14px; height: 14px; padding: 0; }
+    .skill-chip .skill-hide {
+      margin-left: 2px;
+      cursor: pointer;
+      color: var(--muted);
+      background: none;
+      border: none;
+      min-height: unset;
+      padding: 0 2px;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .skill-chip .skill-hide:hover { color: var(--danger); }
+    #archivedToggle {
+      font-size: 11px;
+      color: var(--accent);
+      background: none;
+      border: none;
+      cursor: pointer;
+      min-height: unset;
+      padding: 0;
+      text-align: left;
+    }
+    .panel-toggle-btn {
+      background: none;
+      border: 1px solid var(--line);
+      min-height: 30px;
+      padding: 0 8px;
+      font-size: 16px;
+      line-height: 1;
+      border-radius: 6px;
     }
     .main {
       display: grid;
@@ -410,13 +526,18 @@ HTML = """<!doctype html>
     .composer {
       border-top: 1px solid var(--line);
       background: var(--panel);
-      padding: 12px 16px 16px;
+      padding: 10px 16px 12px;
     }
     .composer-inner {
       max-width: 1120px;
       margin: 0 auto;
       display: grid;
-      gap: 10px;
+      gap: 8px;
+    }
+    .composer-send-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     textarea {
       width: 100%;
@@ -501,8 +622,9 @@ HTML = """<!doctype html>
       align-items: center;
     }
     @media (max-width: 780px) {
-      .app { grid-template-columns: 1fr; }
+      .app { grid-template-columns: 1fr !important; }
       .sidebar { display: none; }
+      .settings-panel { display: none; }
       .msg { grid-template-columns: 1fr; gap: 4px; }
       .role { padding-top: 0; }
       .title strong, .meta { max-width: 58vw; }
@@ -517,10 +639,6 @@ HTML = """<!doctype html>
         <button id="newChat">New</button>
       </div>
       <div id="sessions" class="sessions"></div>
-      <div class="side-foot">
-        <div id="sideStatus">Checking model</div>
-        <div id="workspaceStatus">Workspace: local-coder-workspace</div>
-      </div>
     </aside>
     <section class="main">
       <header class="topbar">
@@ -528,49 +646,27 @@ HTML = """<!doctype html>
           <strong id="chatTitle">Local Qwen3-Coder-Next</strong>
           <span class="meta" id="modelMeta">Ollama :11434</span>
         </div>
-        <div class="status"><span id="dot" class="dot"></span><span id="statusText">Checking</span></div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <div class="status"><span id="dot" class="dot"></span><span id="statusText">Checking</span></div>
+          <button id="panelToggle" class="panel-toggle-btn" title="Toggle settings panel">⚙</button>
+        </div>
       </header>
       <div id="messages" class="messages"></div>
       <form id="form" class="composer">
         <div class="composer-inner">
           <textarea id="prompt" placeholder="Ask for code, debugging, tests, repo analysis, or architecture work."></textarea>
-          <div class="controls">
-            <div class="settings">
-              <label>Max tokens <input id="maxTokens" type="number" min="16" max="8192" step="16" value="1024"></label>
-              <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0"></label>
-              <label>Mode <select id="contextMode"><option value="fast">Fast 32k</option><option value="repo">Repo 128k</option><option value="deep">Deep 262k</option></select></label>
-              <label><input id="keepContext" type="checkbox" checked> Context</label>
-            </div>
-            <div class="settings">
-              <label>Project <input id="projectPath" type="text" placeholder="project path (optional)" style="width: 260px"></label>
-              <label>Skills <input id="skills" type="text" placeholder="skill ids, comma-separated" style="width: 220px"></label>
-            </div>
-            <div>
-              <div id="skillList" class="skill-list"></div>
-            </div>
-            <div class="settings">
-              <a class="link-button" href="/palette" target="_blank">Palette</a>
-              <button id="compileContext" type="button">Compile context</button>
-              <button id="saveLast" type="button">Save last</button>
-              <select id="providerSelect" title="Force LLM backend (Auto = local-first)">
-                <option value="">Auto</option>
-                <option value="ollama">Ollama (local)</option>
-                <option value="openrouter">OpenRouter</option>
-                <option value="bedrock">Bedrock</option>
-                <option value="nim">NIM</option>
-              </select>
-              <button id="send" class="primary" type="submit">Send</button>
-            </div>
+          <div class="composer-send-row">
+            <select id="providerSelect" title="Force LLM backend (Auto = local-first)" style="min-width:110px;">
+              <option value="">Auto</option>
+              <option value="ollama">Ollama (local)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="bedrock">Bedrock</option>
+              <option value="nim">NIM</option>
+            </select>
+            <div id="usage" class="usage" style="flex:1;"></div>
+            <button id="send" class="primary" type="submit">Send</button>
           </div>
-          <div class="settings">
-            <label>Upload files <input id="fileUpload" type="file" multiple></label>
-            <label>Upload folder <input id="folderUpload" type="file" multiple webkitdirectory></label>
-            <button id="uploadFiles" type="button">Upload</button>
-            <button id="dockerMcpTools" type="button">Docker MCP</button>
-            <button id="instructionsBtn" type="button" title="Edit LOCALCODER.md instructions for the project or global">Instructions</button>
-            <button id="kbBtn" type="button" title="Browse and edit knowledge base files">Knowledge Base</button>
-            <button id="mcpConfigBtn" type="button" title="Configure external MCP servers (mcp-servers.json)">MCP Config</button>
-          </div>
+        </div>
 
           <!-- Instructions modal -->
           <div id="instructionsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
@@ -632,10 +728,79 @@ HTML = """<!doctype html>
               </div>
             </div>
           </div>
-          <div id="usage" class="usage"></div>
-        </div>
       </form>
     </section>
+
+    <!-- ── Right settings panel ─────────────────────────────────────────── -->
+    <aside class="settings-panel" id="settingsPanel">
+      <div class="panel-header">
+        <strong>Settings</strong>
+        <button id="panelClose" class="panel-toggle-btn" style="font-size:14px;">✕</button>
+      </div>
+      <div class="panel-body">
+
+        <div class="panel-section">
+          <div class="panel-section-title">Project</div>
+          <input id="projectPath" type="text" placeholder="project path (optional)" style="width:100%;">
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Model</div>
+          <div class="panel-row">
+            <label>Tokens <input id="maxTokens" type="number" min="16" max="8192" step="16" value="1024"></label>
+            <label>Temp <input id="temperature" type="number" min="0" max="2" step="0.1" value="0" style="width:60px;"></label>
+          </div>
+          <div class="panel-row">
+            <label style="width:100%;">Mode
+              <select id="contextMode" style="flex:1;">
+                <option value="fast">Fast 32k</option>
+                <option value="repo">Repo 128k</option>
+                <option value="deep">Deep 262k</option>
+              </select>
+            </label>
+          </div>
+          <div class="panel-row">
+            <label><input id="keepContext" type="checkbox" checked> Keep context</label>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Skills</div>
+          <input id="skills" type="text" placeholder="skill ids, comma-separated" style="width:100%;">
+          <div id="skillList" style="display:flex;flex-wrap:wrap;gap:5px;padding:6px;background:#0f141b;border:1px solid var(--line);border-radius:6px;min-height:40px;"></div>
+          <button id="archivedToggle" type="button">Show archived (0)</button>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Actions</div>
+          <button id="compileContext" type="button" class="panel-btn">Compile context</button>
+          <button id="saveLast" type="button" class="panel-btn">Save last</button>
+          <a class="link-button panel-btn" href="/palette" target="_blank">Palette ↗</a>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Upload</div>
+          <label style="font-size:12px;color:var(--muted);">Files <input id="fileUpload" type="file" multiple></label>
+          <label style="font-size:12px;color:var(--muted);">Folder <input id="folderUpload" type="file" multiple webkitdirectory></label>
+          <button id="uploadFiles" type="button" class="panel-btn">Upload</button>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Tools</div>
+          <button id="dockerMcpTools" type="button" class="panel-btn">Docker MCP</button>
+          <button id="instructionsBtn" type="button" class="panel-btn" title="Edit LOCALCODER.md instructions">Instructions</button>
+          <button id="kbBtn" type="button" class="panel-btn" title="Browse and edit knowledge base files">Knowledge Base</button>
+          <button id="mcpConfigBtn" type="button" class="panel-btn" title="Configure external MCP servers">MCP Config</button>
+        </div>
+
+        <div class="panel-section">
+          <div class="panel-section-title">Status</div>
+          <div id="sideStatus" style="font-size:12px;color:var(--muted);">Checking model…</div>
+          <div id="workspaceStatus" style="font-size:11px;color:var(--muted);margin-top:4px;"></div>
+        </div>
+
+      </div>
+    </aside>
   </div>
   <script>
     const storeKey = "local-coder-ui-v1";
@@ -672,6 +837,45 @@ HTML = """<!doctype html>
       kbBtn: document.getElementById("kbBtn"),
       mcpConfigBtn: document.getElementById("mcpConfigBtn")
     };
+
+    // ── Panel toggle ─────────────────────────────────────────────────────────
+    const appEl = document.querySelector(".app");
+    const panelToggle = document.getElementById("panelToggle");
+    const panelClose = document.getElementById("panelClose");
+    function openPanel()  { appEl.classList.add("panel-open"); localStorage.setItem("lc-panel", "1"); }
+    function closePanel() { appEl.classList.remove("panel-open"); localStorage.setItem("lc-panel", "0"); }
+    panelToggle.onclick = () => appEl.classList.contains("panel-open") ? closePanel() : openPanel();
+    panelClose.onclick  = closePanel;
+    if (localStorage.getItem("lc-panel") !== "0") openPanel(); // default open
+
+    // ── Skills archive ───────────────────────────────────────────────────────
+    let hiddenSkills = new Set(JSON.parse(localStorage.getItem("lc-hidden-skills") || "[]"));
+    let showArchived = false;
+    function saveHidden() { localStorage.setItem("lc-hidden-skills", JSON.stringify([...hiddenSkills])); }
+    function renderSkills(skills) {
+      const list = els.skillList;
+      list.innerHTML = "";
+      let archivedCount = 0;
+      skills.forEach(sk => {
+        const hidden = hiddenSkills.has(sk.id);
+        if (hidden) { archivedCount++; }
+        if (hidden && !showArchived) return;
+        const chip = document.createElement("div");
+        chip.className = "skill-chip";
+        chip.innerHTML = `<input type="checkbox" id="sk_${sk.id}" ${sk.checked ? "checked" : ""}>
+          <label for="sk_${sk.id}" style="cursor:pointer;margin:0;">${sk.label}</label>
+          <button class="skill-hide" type="button" title="${hidden ? 'Restore' : 'Hide'}">${hidden ? '↩' : '✕'}</button>`;
+        chip.querySelector(".skill-hide").onclick = () => {
+          if (hidden) { hiddenSkills.delete(sk.id); } else { hiddenSkills.add(sk.id); }
+          saveHidden();
+          renderSkills(skills);
+        };
+        list.appendChild(chip);
+      });
+      const tog = document.getElementById("archivedToggle");
+      tog.textContent = showArchived ? `Hide archived (${archivedCount})` : `Show archived (${archivedCount})`;
+      tog.onclick = () => { showArchived = !showArchived; renderSkills(skills); };
+    }
     let state = loadState();
 
     function loadState() {
@@ -784,14 +988,11 @@ HTML = """<!doctype html>
       try {
         const res = await fetch("/skills");
         const data = await res.json();
-        const skills = (data.skills || []).slice(0, 24);
-        els.skillList.innerHTML = "";
-        skills.forEach(skill => {
-          const label = document.createElement("label");
-          label.title = skill.description || skill.id;
-          label.innerHTML = `<input type="checkbox" data-skill-id="${skill.name}"> ${skill.name}`;
-          els.skillList.appendChild(label);
-        });
+        const raw = (data.skills || []).slice(0, 48);
+        const skills = raw.map(s => ({id: s.name, label: s.name, checked: false, description: s.description || ""}));
+        renderSkills(skills);
+        // store for re-render on archive toggle
+        els.skillList._skills = skills;
       } catch {
         els.skillList.textContent = "Skills unavailable";
       }
@@ -806,6 +1007,9 @@ HTML = """<!doctype html>
       session.updated = Date.now();
       els.prompt.value = "";
       els.send.disabled = true;
+      els.dot.className = "dot warn";
+      els.statusText.textContent = "Thinking…";
+      els.sideStatus.textContent = "Inference in progress…";
       const t0 = Date.now();
       let _timer = setInterval(() => {
         const s = Math.floor((Date.now() - t0) / 1000);
@@ -829,6 +1033,7 @@ HTML = """<!doctype html>
         const res = await fetch("/chat", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
+          signal: AbortSignal.timeout(600_000),
           body: JSON.stringify({
             messages,
             max_tokens: Math.min(8192, Math.max(16, Number(els.maxTokens.value) || 1024)),
@@ -850,15 +1055,19 @@ HTML = """<!doctype html>
         els.usage.textContent = `prompt ${u.prompt_tokens ?? "-"} | output ${u.completion_tokens ?? "-"} | total ${u.total_tokens ?? "-"} | ${elapsed}s${via}`;
       } catch (err) {
         const elapsed = Math.floor((Date.now() - t0) / 1000);
-        session.messages.push({role: "assistant", content: `Request failed: ${err.message || err}`});
+        const msg = (err.name === "TimeoutError" || err.name === "AbortError")
+          ? `Timed out after ${elapsed}s — model may be stuck. Try a shorter prompt or restart Ollama.`
+          : `Request failed: ${err.message || err}`;
+        session.messages.push({role: "assistant", content: msg});
         els.usage.style.color = "#f85149";
-        els.usage.textContent = `Request failed (${elapsed}s)`;
+        els.usage.textContent = `${err.name === "TimeoutError" || err.name === "AbortError" ? "Timed out" : "Failed"} (${elapsed}s)`;
       } finally {
         clearInterval(_timer);
         els.send.disabled = false;
         saveState();
         render();
         els.prompt.focus();
+        refreshStatus();
       }
     }
     async function saveLastResponse() {
@@ -2372,6 +2581,128 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
                 "returncode": sc_result.returncode,
                 "stdout": sc_result.stdout[-8000:], "stderr": sc_result.stderr[-2000:]}
 
+    elif command == "spark_exec":
+        # SSH remote command execution on Spark-1 or Spark-2
+        # args[0] = node ("spark1" or "spark2"), args[1] = command to run
+        if not args or len(args) < 2:
+            return {"command": command, "returncode": 1,
+                    "stdout": "", "stderr": "spark_exec requires args[0]=node (spark1|spark2), args[1]=command"}
+        node = (args[0] or "spark1").lower()
+        remote_cmd = args[1]
+        if node in ("spark2", "spark-2"):
+            ssh_target = ["-J", "rblake2320@192.168.12.132", "rblake2320@10.0.0.2"]
+        else:
+            ssh_target = ["rblake2320@192.168.12.132"]
+        ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
+                   "-o", "BatchMode=yes"] + ssh_target + [remote_cmd]
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60, check=False)
+        write_trace("tool_run", {"command": command, "node": node, "remote_cmd": remote_cmd,
+                                 "returncode": result.returncode})
+        return {"command": command, "node": node, "remote_cmd": remote_cmd,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-8000:], "stderr": result.stderr[-2000:]}
+
+    elif command == "chkdsk_report":
+        # Windows disk health check via PowerShell SMART / Get-PhysicalDisk
+        # args[0] = drive letter (optional, default all)
+        drive = args[0] if args else None
+        if drive:
+            ps_cmd = (
+                f"Get-PhysicalDisk | Where-Object {{$_.DeviceId -like '*{drive}*'}} | "
+                "Select-Object FriendlyName,MediaType,HealthStatus,OperationalStatus,"
+                "Size,AllocatedSize | Format-List; "
+                f"$vol = Get-Volume -DriveLetter '{drive.rstrip(':').rstrip('\\\\')}';"
+                "$vol | Select-Object DriveLetter,HealthStatus,SizeRemaining,Size | Format-List"
+            )
+        else:
+            ps_cmd = (
+                "Get-PhysicalDisk | Select-Object FriendlyName,MediaType,HealthStatus,"
+                "OperationalStatus,Size | Format-Table -AutoSize; "
+                "Get-Volume | Select-Object DriveLetter,HealthStatus,SizeRemaining,Size | Format-Table -AutoSize"
+            )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=30, check=False
+        )
+        write_trace("tool_run", {"command": command, "drive": drive, "returncode": result.returncode})
+        return {"command": command, "drive": drive, "returncode": result.returncode,
+                "stdout": result.stdout[-8000:], "stderr": result.stderr[-2000:]}
+
+    elif command == "locust_run":
+        # Load testing via locust — requires locustfile.py in project
+        # args[0] = locustfile path, args[1] = --users N, args[2] = --spawn-rate N, args[3] = --run-time Xs
+        locustfile = args[0] if args else "locustfile.py"
+        users = args[1] if len(args) > 1 else "10"
+        spawn_rate = args[2] if len(args) > 2 else "2"
+        run_time = args[3] if len(args) > 3 else "30s"
+        locust_cmd = [
+            sys.executable, "-m", "locust",
+            "-f", locustfile,
+            "--headless",
+            "--users", str(users),
+            "--spawn-rate", str(spawn_rate),
+            "--run-time", run_time,
+            "--csv", os.path.join(workdir, "locust_results")
+        ]
+        result = subprocess.run(locust_cmd, capture_output=True, text=True,
+                                timeout=120, check=False, cwd=workdir)
+        write_trace("tool_run", {"command": command, "locustfile": locustfile,
+                                 "users": users, "returncode": result.returncode})
+        return {"command": command, "locustfile": locustfile, "users": users,
+                "returncode": result.returncode,
+                "stdout": result.stdout[-8000:], "stderr": result.stderr[-2000:]}
+
+    elif command == "tool_search":
+        # Search available tools by name or description keyword
+        # args[0] = search query
+        query = " ".join(args).lower() if args else ""
+        tool_docs = {
+            "read_file": "Read file contents from filesystem",
+            "write_file": "Write content to a file",
+            "list_dir": "List directory contents",
+            "git_status": "Show git working tree status",
+            "git_diff": "Show git diff of current changes",
+            "git_commit": "Commit staged changes with message",
+            "git_push": "Push to remote repository",
+            "git_log": "Show recent commit history",
+            "pytest": "Run Python tests with pytest",
+            "bandit": "Python security scanner (OWASP)",
+            "eslint": "JavaScript/TypeScript linter",
+            "mypy": "Python static type checker",
+            "pip_audit": "Python dependency CVE scanner",
+            "npm_audit": "Node.js dependency CVE scanner",
+            "semgrep": "Multi-language SAST scanner",
+            "cprofile": "Python CPU profiler",
+            "mem_profile": "Python memory profiler",
+            "docker_run": "Run Docker container command",
+            "psql_query": "Execute PostgreSQL query",
+            "wsl_exec": "Run command in WSL2 (Unix tools)",
+            "codegen": "Scaffold project boilerplate (django/fastapi/react/flask/cli)",
+            "nvidia_smi": "GPU utilization and VRAM usage (RTX 5090)",
+            "kubectl_get": "Kubernetes resource queries",
+            "terraform_plan": "Terraform infrastructure plan",
+            "checkov": "IaC security compliance scanner",
+            "sc_list_windows": "List all visible Windows desktop windows",
+            "sc_find": "Find a window by title or executable",
+            "sc_send": "Inject text into any window via Win32 PostMessage",
+            "sc_capture": "Screenshot a window (background-safe via PrintWindow)",
+            "sc_read": "Read window text via UIA accessibility",
+            "sc_click": "Click at window-relative coordinates",
+            "sc_clipboard": "Read or write the system clipboard",
+            "spark_exec": "Run a command on Spark-1 or Spark-2 via SSH",
+            "chkdsk_report": "Windows disk health check via PowerShell",
+            "locust_run": "HTTP load testing via locust",
+            "tool_search": "Search available tools by keyword",
+        }
+        if not query:
+            results = [(k, v) for k, v in tool_docs.items()]
+        else:
+            results = [(k, v) for k, v in tool_docs.items()
+                       if query in k.lower() or any(w in v.lower() for w in query.split())]
+        output = "\n".join(f"  {k:25s} {v}" for k, v in sorted(results))
+        return {"command": command, "query": query, "matches": len(results),
+                "returncode": 0, "stdout": output, "stderr": ""}
+
     else:
         raise ValueError(f"tool not implemented: {command}")
     result = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout_s, check=False)
@@ -3596,7 +3927,11 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "- **Kubernetes** – kubectl_get (returns install instructions if kubectl is absent).\n"
         "- **Terraform** – terraform_plan (returns install instructions if terraform is absent).\n"
         "- **IDE bridge** – the /chat API is OpenAI-compatible; connect any IDE plugin that supports custom endpoints.\n"
-        "- **LoRA fine-tuning** – RTX 5090 + 128 GB RAM supports local fine-tuning workflows.",
+        "- **LoRA fine-tuning** – RTX 5090 + 128 GB RAM supports local fine-tuning workflows.\n"
+        "- **Remote Spark execution** – spark_exec tool runs any command on Spark-1 (192.168.12.132) or Spark-2 (10.0.0.2) via SSH (args: node=spark1|spark2, command).\n"
+        "- **Disk health** – chkdsk_report tool checks Windows disk health via PowerShell Get-PhysicalDisk / Get-Volume (especially important: D: drive has 26k+ NTFS errors — use this to check before writing to D:).\n"
+        "- **Load testing** – locust_run tool runs headless HTTP load tests (args: locustfile, users, spawn-rate, run-time).\n"
+        "- **Tool discovery** – tool_search tool lists/filters all available tools by keyword.",
         f"Context mode: {mode} ({mode_config['ctx']} tokens available on the running model).",
     ]
     if skill_context:
@@ -5197,6 +5532,37 @@ def safe_slug(text: str) -> str:
     return (slug or "local-coder-output")[:72]
 
 
+class LocalCoderServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that silences client-disconnect noise."""
+    _SILENT_ERRORS = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self._SILENT_ERRORS):
+            return  # browser closed connection mid-response — normal, don't log
+        super().handle_error(request, client_address)
+
+
+_PID_FILE = Path(tempfile.gettempdir()) / f"local_coder_{PORT}.pid"
+
+
+def _kill_stale_server() -> None:
+    """Kill any server left from a previous run, using its PID file."""
+    try:
+        if not _PID_FILE.exists():
+            return
+        old_pid = int(_PID_FILE.read_text().strip())
+        if old_pid == os.getpid():
+            return
+        try:
+            os.kill(old_pid, 9)  # SIGKILL / TerminateProcess on Windows
+        except (OSError, ProcessLookupError):
+            pass  # already gone
+        _PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local browser UI for Qwen3-Coder-Next")
     parser.add_argument("--host", default=HOST)
@@ -5240,8 +5606,11 @@ def _disk_cleanup_loop() -> None:
 
 def main() -> int:
     args = parse_args()
+    _kill_stale_server()
     url = f"http://{args.host}:{args.port}/"
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = LocalCoderServer((args.host, args.port), Handler)
+    _PID_FILE.write_text(str(os.getpid()))
+    atexit.register(lambda: _PID_FILE.unlink(missing_ok=True))
     cleanup_thread = threading.Thread(target=_disk_cleanup_loop, daemon=True, name="disk-cleanup")
     cleanup_thread.start()
     print(f"Local coder browser: {url}", flush=True)
