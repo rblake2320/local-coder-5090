@@ -3,19 +3,29 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 BASE_URL = "http://127.0.0.1:8022"
+API_KEY = os.environ.get("LOCAL_CODER_API_KEY", "")
+
+
+def _auth_headers() -> dict:
+    """Return auth header if LOCAL_CODER_API_KEY is set (matches server auth)."""
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
 
 
 def post_json(path: str, payload: dict) -> dict:
     req = Request(
         f"{BASE_URL}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers(),
         method="POST",
     )
     with urlopen(req, timeout=1800) as resp:
@@ -23,7 +33,8 @@ def post_json(path: str, payload: dict) -> dict:
 
 
 def get_json(path: str) -> dict:
-    with urlopen(f"{BASE_URL}{path}", timeout=10) as resp:
+    req = Request(f"{BASE_URL}{path}", headers=_auth_headers(), method="GET")
+    with urlopen(req, timeout=10) as resp:
         return json.loads(resp.read())
 
 
@@ -74,6 +85,7 @@ def cmd_patch(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    global BASE_URL
     parser = argparse.ArgumentParser(description="Local Coder 5090 CLI")
     parser.add_argument("--base-url", default=BASE_URL)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -104,15 +116,25 @@ def main() -> int:
     p_patch.add_argument("--apply", action="store_true")
 
     args = parser.parse_args()
-    global BASE_URL
     BASE_URL = args.base_url
 
     dispatch = {"status": cmd_status, "chat": cmd_chat, "loop": cmd_loop, "patch": cmd_patch}
     try:
         dispatch[args.cmd](args)
         return 0
-    except (HTTPError, URLError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        print(f"Error: HTTP {exc.code} {exc.reason}\n{detail}", file=sys.stderr)
+        return 1
+    except URLError as exc:
+        print(
+            f"Error: cannot reach {BASE_URL} — is the server running? ({exc.reason})",
+            file=sys.stderr,
+        )
         return 1
 
 

@@ -98,8 +98,8 @@ function Install-Service {
         "LOCAL_CODER_HOME=$InstallDir" `
         "LOCAL_CODER_WORKSPACE=$workspace" `
         "LOCAL_CODER_MODEL_BASE=http://localhost:11434" `
-        "LOCAL_CODER_MODEL=deepseek-r1:32b" `
-        "LOCAL_CODER_FAST_MODEL=gemma3:latest"
+        "LOCAL_CODER_MODEL=qwen3:32b" `
+        "LOCAL_CODER_FAST_MODEL=gemma4:latest"
 
     # Start it
     Write-Host "Starting service..." -ForegroundColor Cyan

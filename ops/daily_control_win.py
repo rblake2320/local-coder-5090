@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 NSSM = Path(r"D:\tools\nssm\nssm.exe")
 OLLAMA_BASE = "http://localhost:11434"
@@ -74,7 +74,7 @@ def gpu_stats() -> dict[str, Any]:
         return {"error": "nvidia-smi not available"}
     fields = [f.strip() for f in r.stdout.strip().split(",")]
     keys = ["name", "mem_total_mb", "mem_used_mb", "mem_free_mb", "temp_c", "util_pct"]
-    return dict(zip(keys, fields))
+    return dict(zip(keys, fields, strict=False))
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -156,8 +156,9 @@ def cmd_model_mode(mode: str) -> dict[str, Any]:
         return {"model_mode": "off", "results": results}
 
     if mode == "on":
-        # Pre-load the primary model by sending an empty generate
-        model = "deepseek-r1:32b"
+        # Pre-load the primary model by sending an empty generate.
+        # Keep in sync with local_coder_browser.py MODEL default.
+        model = os.environ.get("LOCAL_CODER_MODEL", "qwen3:32b")
         try:
             payload = json.dumps({"model": model, "prompt": "", "stream": False}).encode()
             req = Request(

@@ -17,14 +17,16 @@ Secrets loaded from:
 Run: python server.py stdio
 """
 
+import asyncio
+import json
 import os
 import sys
-import json
-import asyncio
-import httpx
-from pathlib import Path
+import uuid
 from datetime import datetime
-from typing import Annotated, Optional
+from pathlib import Path
+from typing import Annotated
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -64,12 +66,12 @@ def get_nvidia_api_key() -> str:
     key = get_secret_from_aws("ai-business/nvidia-api-key")
     if key:
         return key
-    
+
     # 2. Fall back to environment variables
     key = os.environ.get("NVIDIA_API_KEY", os.environ.get("NGC_API_KEY", ""))
     if key:
         return key
-    
+
     return ""
 
 # =============================================================================
@@ -205,7 +207,7 @@ Expertise:
 Automate everything. Provide IaC examples and deployment strategies.""",
 
     # === EXTENDED TEAM (from trained adapters) ===
-    
+
     "qa_engineer": """You are QAEngineer, a quality assurance specialist.
 
 Expertise:
@@ -350,7 +352,7 @@ Expertise:
 Qualify leads accurately. Recommend next steps.""",
 
     # === SAFETY & VALIDATION ===
-    
+
     "debug_doctor": """You are DebugDoctor, a debugging specialist.
 
 Expertise:
@@ -407,17 +409,15 @@ app = MCPApp(
 # FLYWHEEL DATA COLLECTION (for training improvement)
 # =============================================================================
 
-import uuid
-from pathlib import Path
 
 class FlywheelCollector:
     """Collects MCP interactions for the training flywheel."""
-    
+
     def __init__(self, data_dir: str = FLYWHEEL_DATA_DIR):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.enabled = FLYWHEEL_ENABLED
-        
+
     async def collect(
         self,
         specialist: str,
@@ -427,12 +427,12 @@ class FlywheelCollector:
         inference_backend: str = "unknown",
         tokens_used: int = 0,
         processing_time_ms: float = 0,
-        user_feedback: int = None  # -1, 0, 1
+        user_feedback: int | None = None  # -1, 0, 1
     ):
         """Collect an interaction for training."""
         if not self.enabled:
             return
-            
+
         now = datetime.now()  # single call: timestamp and date_str stay on the same day
         interaction = {
             "id": str(uuid.uuid4()),
@@ -450,7 +450,7 @@ class FlywheelCollector:
         # Write to daily JSONL file
         date_str = now.strftime("%Y%m%d")
         filepath = self.data_dir / f"mcp_{date_str}.jsonl"
-        
+
         try:
             with open(filepath, "a") as f:
                 f.write(json.dumps(interaction) + "\n")
@@ -489,13 +489,13 @@ async def try_local_inference(
                     continue  # malformed response; try next URL
                 backend = f"local_spark{i+1}" if i > 0 else "local"
                 return choices[0]["message"]["content"], backend
-        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        except (httpx.HTTPError, httpx.TimeoutException):
             continue  # network failure; try next URL
         except Exception as exc:
             # structural/parse error — log it, but don't silently swallow
             print(f"[local_inference] unexpected error on {url}: {exc}", flush=True)
             continue
-    
+
     return None, None
 
 
@@ -561,12 +561,12 @@ async def call_model(
 ) -> str:
     """
     Call the model with fallback chain (configurable order):
-    
+
     local_first (FREE - your hardware):
       1. Local Spark servers (multi-spark load balanced)
       2. AWS Bedrock (Claude)
       3. NVIDIA NIM (Llama 70B)
-    
+
     bedrock_first (PAID - reliable):
       1. AWS Bedrock (Claude)
       2. Local Spark servers
@@ -575,72 +575,72 @@ async def call_model(
     import time
     start_time = time.time()
     backend_used = "unknown"
-    
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
     ]
-    
+
     payload = {
         "model": DEFAULT_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens
     }
-    
+
     result = None
-    
+
     # === LOCAL FIRST STRATEGY (FREE) ===
     if MODEL_STRATEGY == "local_first":
         async with httpx.AsyncClient(timeout=180.0) as client:
             # Try all local Spark servers
             result, backend_used = await try_local_inference(messages, payload, client)
-            
+
             if not result and BOTO3_AVAILABLE:
                 # Fall back to Bedrock
                 result = call_bedrock_sync(system_prompt, user_message, max_tokens, temperature, model_tier)
                 if result:
                     backend_used = "bedrock"
-            
+
             if not result and NVIDIA_API_KEY:
                 # Fall back to NVIDIA NIM
                 result, backend_used = await _try_nvidia(payload, client, retries)
-    
+
     # === BEDROCK FIRST STRATEGY (PAID, RELIABLE) ===
     elif MODEL_STRATEGY == "bedrock_first":
         if BOTO3_AVAILABLE:
             result = call_bedrock_sync(system_prompt, user_message, max_tokens, temperature, model_tier)
             if result:
                 backend_used = "bedrock"
-        
+
         if not result:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 # Try local Spark servers
                 result, backend_used = await try_local_inference(messages, payload, client)
-                
+
                 if not result and NVIDIA_API_KEY:
                     # Fall back to NVIDIA NIM
                     result, backend_used = await _try_nvidia(payload, client, retries)
-    
+
     # === NVIDIA FIRST STRATEGY ===
     else:
         async with httpx.AsyncClient(timeout=180.0) as client:
             if NVIDIA_API_KEY:
                 result, backend_used = await _try_nvidia(payload, client, retries)
-            
+
             if not result:
                 result, backend_used = await try_local_inference(messages, payload, client)
-            
+
             if not result and BOTO3_AVAILABLE:
                 result = call_bedrock_sync(system_prompt, user_message, max_tokens, temperature, model_tier)
                 if result:
                     backend_used = "bedrock"
-    
+
     # Default error
     if not result:
         result = "[Error: All inference backends failed. Check local server, Bedrock access, or NVIDIA_API_KEY.]"
         backend_used = "error"
-    
+
     # === COLLECT FOR FLYWHEEL (training improvement) ===
     processing_time_ms = (time.time() - start_time) * 1000
     await flywheel.collect(
@@ -651,7 +651,7 @@ async def call_model(
         inference_backend=backend_used,
         processing_time_ms=processing_time_ms
     )
-    
+
     return result
 
 
@@ -668,7 +668,7 @@ async def _try_nvidia(payload: dict, client: httpx.AsyncClient, retries: int = 2
                     "Content-Type": "application/json"
                 }
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 return data["choices"][0]["message"]["content"], "nvidia"
@@ -680,7 +680,7 @@ async def _try_nvidia(payload: dict, client: httpx.AsyncClient, retries: int = 2
             else:
                 # Bug #1 fix: return None not an error string; callers check `if result:`
                 return None, "nvidia_error"
-                    
+
         except httpx.TimeoutException:
             last_error = "Request timed out"
             if attempt < retries:
@@ -691,8 +691,9 @@ async def _try_nvidia(payload: dict, client: httpx.AsyncClient, retries: int = 2
             if attempt < retries:
                 await asyncio.sleep(1)
                 continue
-    
-    return None, "nvidia_error"
+
+    # All retries exhausted — return the captured reason so callers can diagnose.
+    return None, f"nvidia_error: {last_error}" if last_error else "nvidia_error"
 
 
 # =============================================================================
@@ -703,7 +704,7 @@ async def _try_nvidia(payload: dict, client: httpx.AsyncClient, retries: int = 2
 async def local_coder_chat(
     prompt: Annotated[str, "Coding prompt or task for the local Qwen3-Coder-Next model"],
     context: Annotated[str, "Optional extra repo, file, or task context"] = "",
-    skills: Annotated[Optional[list[str]], "Optional Codex skill ids/names to inject"] = None,
+    skills: Annotated[list[str] | None, "Optional Codex skill ids/names to inject"] = None,
     project_path: Annotated[str, "Optional project path for repo context and memory"] = "",
     context_mode: Annotated[str, "Context mode: fast, repo, or deep"] = "fast",
     max_tokens: Annotated[int, "Maximum tokens to generate"] = 1024,
@@ -757,7 +758,7 @@ async def local_coder_status() -> dict:
 @app.tool
 async def local_coder_run_safe_tool(
     command: Annotated[str, "Allowlisted command name, such as pwd, ls, rg, git_status, git_diff, pytest, or py_compile"],
-    args: Annotated[Optional[list[str]], "Optional command arguments"] = None,
+    args: Annotated[list[str] | None, "Optional command arguments"] = None,
     cwd: Annotated[str, "Working directory"] = r"C:\Users\techai\local-coder",
     timeout_s: Annotated[int, "Timeout in seconds"] = 60
 ) -> dict:
@@ -776,9 +777,9 @@ async def local_coder_run_safe_tool(
 @app.tool
 async def local_coder_tool_chat(
     prompt: Annotated[str, "Question or task to answer after running allowlisted tools"],
-    tools: Annotated[Optional[list[str]], "Allowlisted tool names to run first"] = None,
+    tools: Annotated[list[str] | None, "Allowlisted tool names to run first"] = None,
     project_path: Annotated[str, "Project path for tool execution and context"] = r"C:\Users\techai\local-coder",
-    skills: Annotated[Optional[list[str]], "Optional Codex skill ids/names to inject"] = None,
+    skills: Annotated[list[str] | None, "Optional Codex skill ids/names to inject"] = None,
     context_mode: Annotated[str, "Context mode: fast, repo, or deep"] = "fast",
     max_tokens: Annotated[int, "Maximum tokens to generate"] = 1024
 ) -> dict:
@@ -828,8 +829,8 @@ async def local_coder_coding_loop(
     cwd: Annotated[str, "Git repository working directory"] = r"C:\Users\techai\local-coder",
     patch: Annotated[str, "Optional unified diff to check/apply"] = "",
     apply: Annotated[bool, "Apply the patch after git apply --check succeeds"] = False,
-    verify_tools: Annotated[Optional[list[dict]], "Verification tool specs such as {'command':'pytest','args':['tests']}"] = None,
-    skills: Annotated[Optional[list[str]], "Optional Codex skill ids/names to inject"] = None,
+    verify_tools: Annotated[list[dict] | None, "Verification tool specs such as {'command':'pytest','args':['tests']}"] = None,
+    skills: Annotated[list[str] | None, "Optional Codex skill ids/names to inject"] = None,
     context_mode: Annotated[str, "Context mode: fast, repo, or deep"] = "fast"
 ) -> dict:
     """
@@ -930,7 +931,7 @@ async def local_coder_docker_mcp_tools() -> dict:
 @app.tool
 async def local_coder_docker_mcp_call(
     name: Annotated[str, "Explicitly allowlisted Docker MCP tool name"],
-    arguments: Annotated[Optional[dict], "Scalar key/value arguments"] = None
+    arguments: Annotated[dict | None, "Scalar key/value arguments"] = None
 ) -> dict:
     """
     Call an explicitly allowlisted Docker MCP Toolkit tool through Local Coder.
@@ -1232,7 +1233,7 @@ async def delegate_task(
 ) -> dict:
     """
     Auto-route a task to the best specialist from the full 22-specialist roster.
-    
+
     Available specialists:
     - Core: software_engineer, security_analyst, financial_analyst, solutions_architect,
             compliance_officer, contract_analyst, data_engineer, devops_engineer
@@ -1240,12 +1241,12 @@ async def delegate_task(
                 technical_writer, ux_designer, rust_engineer, python_architect,
                 support_engineer, selenium_sensei, account_executive, sales_dev_rep
     - Safety: debug_doctor, ops_sheriff, prompt_injection_sentinel, safety_validator
-    
+
     Use 'hints' to specify a specialist directly, e.g. hints="rust_engineer"
     """
     task_lower = task.lower()
     hints_lower = hints.lower() if hints else ""
-    
+
     # If hints specify a specialist directly, use it
     if hints_lower in SPECIALIST_PROMPTS:
         specialist = hints_lower
@@ -1297,19 +1298,19 @@ async def delegate_task(
         specialist = "devops_engineer"
     else:
         specialist = "software_engineer"  # Default
-    
+
     # Detect if this is a CODE GENERATION task (use 2-pass)
     code_keywords = ["write", "create", "implement", "build", "code", "function", "class", "script", "program", "generate code"]
     is_code_task = any(kw in task_lower for kw in code_keywords) and specialist in [
-        "software_engineer", "python_architect", "rust_engineer", "data_engineer", 
+        "software_engineer", "python_architect", "rust_engineer", "data_engineer",
         "devops_engineer", "selenium_sensei", "qa_engineer"
     ]
-    
+
     # Get the prompt
     prompt = f"{task}"
     if hints:
         prompt = f"{task}\n\nAdditional context: {hints}"
-    
+
     # === 2-PASS FOR CODE TASKS ===
     if is_code_task:
         # Pass 1: Generate code
@@ -1319,7 +1320,7 @@ async def delegate_task(
             max_tokens=3000,
             specialist=specialist
         )
-        
+
         # Pass 2: Review for bugs
         review_response = await call_model(
             CODE_REVIEW_PROMPT,
@@ -1327,12 +1328,12 @@ async def delegate_task(
             max_tokens=2000,
             specialist="code_reviewer"
         )
-        
+
         # Determine final code
         # Bug #3 fix: OR logic made this always-true; AND means we only extract when the marker is present
         has_corrections = "CORRECTED VERSION" in review_response
         final_code = review_response.split("CORRECTED VERSION")[-1].strip() if has_corrections else initial_response
-        
+
         return {
             "routed_to": specialist,
             "response": final_code,
@@ -1343,7 +1344,7 @@ async def delegate_task(
             "task": task[:200],
             "timestamp": datetime.now().isoformat()
         }
-    
+
     # === SINGLE PASS FOR NON-CODE TASKS ===
     response = await call_model(
         SPECIALIST_PROMPTS.get(specialist, SPECIALIST_PROMPTS["software_engineer"]),
@@ -1351,7 +1352,7 @@ async def delegate_task(
         max_tokens=3000,
         specialist=specialist
     )
-    
+
     return {
         "routed_to": specialist,
         "response": response,
@@ -1372,7 +1373,7 @@ async def collaborate(
     """
     specialist_list = [s.strip() for s in specialists.split(",")]
     results = {}
-    
+
     for spec in specialist_list:
         if spec in SPECIALIST_PROMPTS:
             response = await call_model(
@@ -1384,7 +1385,7 @@ async def collaborate(
             results[spec] = response
         else:
             results[spec] = f"[Unknown specialist: {spec}]"
-    
+
     return {
         "task": task[:200],
         "specialists": specialist_list,
@@ -1427,28 +1428,28 @@ async def generate_and_review_code(
 ) -> dict:
     """
     2-PASS CODE GENERATION with automatic review.
-    
+
     Pass 1: Generate code with software_engineer
     Pass 2: Review for common bugs with code_reviewer
-    
+
     This improves code accuracy from ~75% to ~90%.
     """
     import time
     start_time = time.time()
-    
+
     # === PASS 1: Generate Code ===
     prompt = f"Task: {task}\nLanguage: {language}"
     if context:
         prompt += f"\nContext: {context}"
     prompt += "\n\nProvide complete, production-ready code with type hints and error handling."
-    
+
     initial_code = await call_model(
         SPECIALIST_PROMPTS["software_engineer"],
         prompt,
         max_tokens=3000,
         specialist="software_engineer"
     )
-    
+
     # === PASS 2: Review Code ===
     review_prompt = f"""Review this {language} code for bugs and issues:
 
@@ -1457,20 +1458,20 @@ async def generate_and_review_code(
 ```
 
 Original task: {task}"""
-    
+
     review_result = await call_model(
         CODE_REVIEW_PROMPT,
         review_prompt,
         max_tokens=3000,
         specialist="code_reviewer"
     )
-    
+
     # Determine if code was corrected
     # Bug #3 fix: AND so we only extract when CORRECTED VERSION marker is present
     has_corrections = "CORRECTED VERSION" in review_result
-    
+
     processing_time_ms = (time.time() - start_time) * 1000
-    
+
     return {
         "task": task[:200],
         "language": language,
@@ -1498,16 +1499,16 @@ async def review_code(
 ```{language}
 {code}
 ```"""
-    
+
     review_result = await call_model(
         CODE_REVIEW_PROMPT,
         review_prompt,
         max_tokens=2500,
         specialist="code_reviewer"
     )
-    
+
     issues_found = "NO ISSUES FOUND" not in review_result.upper()
-    
+
     return {
         "review": review_result,
         "issues_found": issues_found,
@@ -1538,11 +1539,10 @@ def list_specialists() -> dict:
             "debug_doctor", "ops_sheriff", "prompt_injection_sentinel", "safety_validator"
         ]
     }
-    
+
     specialists_info = {}
-    for name in SPECIALIST_PROMPTS:
+    for name, prompt in SPECIALIST_PROMPTS.items():
         # Extract first line of expertise from prompt
-        prompt = SPECIALIST_PROMPTS[name]
         if "Expertise:" in prompt:
             parts = prompt.split("Expertise:")[1].split("\n")
             # Bug #8 fix: guard against prompts with no second line after Expertise:
@@ -1550,7 +1550,7 @@ def list_specialists() -> dict:
         else:
             expertise_line = "General specialist"
         specialists_info[name] = expertise_line
-    
+
     return {
         "total_specialists": len(SPECIALIST_PROMPTS),
         "categories": categories,
@@ -1563,7 +1563,7 @@ def list_specialists() -> dict:
 def get_system_status() -> dict:
     """Get AI Army system status including model availability."""
     base_dir = Path(__file__).parent.parent.parent
-    
+
     status = {
         "timestamp": datetime.now().isoformat(),
         "inference_mode": "nvidia_nim" if NVIDIA_API_KEY else "local_only",
@@ -1571,14 +1571,14 @@ def get_system_status() -> dict:
         "specialists_available": list(SPECIALIST_PROMPTS.keys()),
         "adapters": []
     }
-    
+
     # Check adapters
     adapters_dir = base_dir / "adapters"
     if adapters_dir.exists():
         for adapter in adapters_dir.iterdir():
             if adapter.is_dir() and not adapter.name.startswith("_"):
                 status["adapters"].append(adapter.name)
-    
+
     # System health
     if PSUTIL_AVAILABLE:
         status["system_health"] = {
@@ -1586,7 +1586,7 @@ def get_system_status() -> dict:
             "memory_percent": psutil.virtual_memory().percent,
             "disk_percent": psutil.disk_usage('/').percent
         }
-    
+
     return status
 
 
@@ -1618,18 +1618,18 @@ async def ocr_extract_text(
             if response.status_code != 200:
                 return {"error": f"Failed to download image: {response.status_code}"}
             image_data = response.content
-        
+
         # Use NVIDIA vision API for OCR
         import base64
         image_b64 = base64.b64encode(image_data).decode()
-        
+
         # Bug #2 fix: actually include the base64 data in the prompt so the model can see it
         ocr_response = await call_model(
             "You are an OCR specialist. Extract ALL text from the image accurately.",
             f"Extract all text from this image. Return the text exactly as it appears.\n\nImage (base64, {language}):\ndata:image/png;base64,{image_b64}",
             max_tokens=2000
         )
-        
+
         return {
             "text": ocr_response,
             "language": language,
@@ -1648,7 +1648,7 @@ async def vision_analyze(
 ) -> dict:
     """
     Analyze an image using computer vision.
-    
+
     Tasks:
     - describe: Generate a detailed description
     - classify: Classify the image content
@@ -1660,22 +1660,22 @@ async def vision_analyze(
             response = await client.get(image_url)
             if response.status_code != 200:
                 return {"error": f"Failed to download image: {response.status_code}"}
-        
+
         task_prompts = {
             "describe": "Describe this image in detail. Include objects, colors, composition, and mood.",
             "classify": "Classify this image. What category does it belong to? List the top 3 categories.",
             "detect_objects": "List all objects visible in this image with their approximate positions.",
             "answer_question": f"Look at this image and answer: {question}"
         }
-        
+
         prompt = task_prompts.get(task, task_prompts["describe"])
-        
+
         vision_response = await call_model(
             "You are a computer vision expert. Analyze images accurately and thoroughly.",
             prompt,
             max_tokens=1500
         )
-        
+
         return {
             "task": task,
             "analysis": vision_response,
@@ -1698,7 +1698,7 @@ async def generate_image(
     sd35_key = get_sd35_api_key()
     if not sd35_key:
         return {"error": "NVIDIA SD3.5 API key not configured. Add to AWS Secrets Manager."}
-    
+
     try:
         style_prompts = {
             "photorealistic": "photorealistic, high detail, 8k, professional photography",
@@ -1706,9 +1706,9 @@ async def generate_image(
             "3d_render": "3D render, octane render, ray tracing, detailed",
             "sketch": "pencil sketch, hand-drawn, artistic lines"
         }
-        
+
         enhanced_prompt = f"{prompt}, {style_prompts.get(style, '')}"
-        
+
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 "https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-5-large",
@@ -1725,7 +1725,7 @@ async def generate_image(
                     "Accept": "application/json"
                 }
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 return {
@@ -1764,12 +1764,12 @@ Be specific about spatial relationships and materials."""
 
     response = await call_model(
         """You are a 3D Scene Planner specialist. You convert text descriptions into detailed 3D scene specifications.
-        
+
 Output valid JSON with scene structure including objects, positions, materials, lighting, and camera.""",
         scene_prompt,
         max_tokens=2000
     )
-    
+
     return {
         "scene_plan": response,
         "description": description,
@@ -1793,7 +1793,7 @@ async def transcribe_audio(
             if response.status_code != 200:
                 return {"error": f"Failed to download audio: {response.status_code}"}
             audio_size = len(response.content)
-        
+
         # Use AI to describe what transcription would produce
         # (In production, this would call Whisper or NVIDIA Riva)
         transcription = await call_model(
@@ -1801,7 +1801,7 @@ async def transcribe_audio(
             f"An audio file of {audio_size} bytes was provided for transcription in language: {language}. Describe how you would transcribe it and what tools you would use (Whisper, NVIDIA Riva, etc.).",
             max_tokens=500
         )
-        
+
         return {
             "status": "transcription_info",
             "info": transcription,
@@ -1821,7 +1821,7 @@ async def process_document(
 ) -> dict:
     """
     Process documents (PDF, Word, Excel) and extract content.
-    
+
     Tasks:
     - extract_text: Get all text from document
     - summarize: Generate a summary
@@ -1834,20 +1834,20 @@ async def process_document(
             if response.status_code != 200:
                 return {"error": f"Failed to download document: {response.status_code}"}
             doc_size = len(response.content)
-        
+
         task_prompts = {
             "extract_text": "Extract and return all text content from this document.",
             "summarize": "Provide a comprehensive summary of this document's key points.",
             "extract_tables": "Identify and extract any tables in this document as structured data.",
             "analyze": "Analyze this document: identify key themes, important points, and provide insights."
         }
-        
+
         doc_response = await call_model(
             "You are a document processing specialist expert in PDFs, Word docs, and spreadsheets.",
             f"{task_prompts.get(task, task_prompts['extract_text'])}\n\nDocument size: {doc_size} bytes",
             max_tokens=2000
         )
-        
+
         return {
             "task": task,
             "result": doc_response,
@@ -1865,7 +1865,7 @@ async def web_scrape(
 ) -> dict:
     """
     Scrape and analyze web pages.
-    
+
     Tasks:
     - get_text: Extract all visible text
     - get_links: Extract all links
@@ -1878,20 +1878,20 @@ async def web_scrape(
             if response.status_code != 200:
                 return {"error": f"Failed to fetch page: {response.status_code}"}
             html_content = response.text[:10000]  # Limit to first 10KB
-        
+
         task_prompts = {
             "get_text": f"Extract the main text content from this HTML:\n\n{html_content[:3000]}",
             "get_links": f"Extract all links (URLs) from this HTML:\n\n{html_content[:3000]}",
             "get_images": f"Extract all image URLs from this HTML:\n\n{html_content[:3000]}",
             "extract_data": f"Extract structured data (product info, article content, etc.) from this HTML:\n\n{html_content[:3000]}"
         }
-        
+
         scrape_response = await call_model(
             "You are a web scraping specialist. Extract the requested information accurately.",
             task_prompts.get(task, task_prompts["get_text"]),
             max_tokens=2000
         )
-        
+
         return {
             "url": url,
             "task": task,
@@ -1927,12 +1927,12 @@ Output as structured JSON."""
 
     response = await call_model(
         """You are a Conversation Designer specialist. You design voice AI agents and chatbots.
-        
+
 Design natural, helpful conversational experiences with clear dialogue flows.""",
         design_prompt,
         max_tokens=2500
     )
-    
+
     return {
         "agent_design": response,
         "description": description,

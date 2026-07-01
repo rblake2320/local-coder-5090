@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-coder-5090"
+version = "0.3.0"
+description = "On-device coding assistant for RTX 5090 / Windows 11 — stdlib-only HTTP loop over Ollama."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "rblake2320" }]
+keywords = ["ollama", "local-llm", "coding-agent", "rtx-5090", "mcp"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Software Development :: Code Generators",
+]
+
+# Core runtime is stdlib-only by design. Everything below is OPTIONAL and only
+# activates a fallback backend or an extra tool when present.
+dependencies = []
+
+[project.optional-dependencies]
+# Cloud fallback backends (post_model chain: Ollama -> OpenRouter -> Bedrock -> NIM)
+bedrock = ["boto3>=1.34"]
+# MCP arcade server (mcp/arcade/server.py)
+mcp = ["arcade-mcp-server", "httpx>=0.27", "psutil>=5.9"]
+# Local security/lint tools exposed via /tools/run
+tools = ["bandit>=1.7", "mypy>=1.10", "pip-audit>=2.7", "semgrep>=1.75"]
+# Development / CI
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/rblake2320/local-coder-5090"
+Repository = "https://github.com/rblake2320/local-coder-5090"
+
+# NOTE: no [project.scripts] entry point on purpose. `scripts/` is not an
+# importable package; the CLI is invoked directly:
+#   python scripts/local_coder_cli.py status
+# An entry point pointing at scripts.local_coder_cli would install but crash
+# at runtime with ModuleNotFoundError.
+
+# Explicit package list: this repo is a flat layout with several non-package
+# top-level dirs (scripts/, mcp/, ops/, config/). Without this, setuptools
+# auto-discovery fails the editable install entirely.
+[tool.setuptools]
+packages = ["local_coder"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+# Offline unit tests run everywhere; live integration tests are opt-in via -m live
+markers = [
+    "live: integration tests that require a running server on :8022 (deselect with '-m \"not live\"')",
+]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = ["__pycache__", ".git"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "PL", "RUF"]
+ignore = [
+    "E501",     # line length handled by formatter tolerance
+    "PLR0911",  # many returns are fine in backend-fallback dispatch
+    "PLR0912",  # run_safe_tool is intentionally one big allowlist branch
+    "PLR0913",  # tool handlers take many explicit args by design
+    "PLR0915",  # ditto — statements per function
+    "PLR2004",  # magic numbers acceptable in threshold constants
+    "PLW0603",  # module-global override in CLI is intentional
+    "PLW1510",  # subprocess.run without check=: intentional, returncode captured manually
+    "PLC0415",  # lazy/optional imports (boto3, urllib helpers) are deliberate
+    "RUF001",   # ambiguous-unicode: em-dashes/arrows in comments are intentional
+    "RUF005",   # list-concat style is clearer than unpacking in these spots
+    "B008",     # http.server handler patterns
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR2004", "S101"]
+# Unit tests must set env vars before importing the module under test.
+"tests/unit/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+# The server is a large stdlib script; start lenient and tighten over time.
+check_untyped_defs = false

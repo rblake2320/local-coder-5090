@@ -3,10 +3,17 @@
 Requires the server running on :8022:
   python scripts/local_coder_browser.py --no-open
   python -m pytest tests/ops/test_local_coder_browser.py -v
+
+All tests here are marked 'live'. To run only offline tests:
+  python -m pytest -m "not live"
 """
 import json
 import urllib.error
 import urllib.request
+
+import pytest
+
+pytestmark = pytest.mark.live
 
 BASE = "http://127.0.0.1:8022"
 
@@ -104,7 +111,7 @@ def test_tool_tool_search():
 def test_tool_unknown_rejected():
     try:
         _post("/tools/run", {"command": "rm_rf_everything", "args": []})
-        assert False, "should have raised"
+        pytest.fail("should have raised")
     except urllib.error.HTTPError as e:
         assert e.code in (400, 403, 422, 500)
 
@@ -124,6 +131,6 @@ def test_control_impact():
 def test_control_bad_action_rejected():
     try:
         _post("/control", {"action": "drop_all_tables"})
-        assert False, "should have raised"
+        pytest.fail("should have raised")
     except urllib.error.HTTPError as e:
         assert e.code in (400, 403, 422, 500)

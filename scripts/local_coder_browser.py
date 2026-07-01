@@ -20,8 +20,8 @@ Improvements vs Spark original:
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
-import sys
 import binascii
 import hashlib
 import html
@@ -31,21 +31,20 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
+import tempfile
 import threading
 import time
-import atexit
-import tempfile
 import webbrowser
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urlparse
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
-
 
 HOST = "127.0.0.1"
 PORT = 8022
@@ -1450,11 +1449,15 @@ def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
         try:
             or_key = os.environ.get("OPENROUTER_API_KEY", "")
             if or_key:
-                # Map local model names to OpenRouter equivalents
+                # Map local model names to OpenRouter equivalents (verified against
+                # openrouter.ai/google, June 2026). Update if slugs change.
                 _OR_MODELS: dict[str, str] = {
                     "qwen3:32b": "qwen/qwen3-32b",
                     "qwen3:32b-gpu": "qwen/qwen3-32b",
-                    "gemma4:latest": "google/gemma-3-27b-it",
+                    "gemma4:latest": "google/gemma-4-26b-a4b-it",
+                    "gemma4:26b": "google/gemma-4-26b-a4b-it",
+                    "gemma4:31b": "google/gemma-4-31b-it",
+                    "gemma3:latest": "google/gemma-3-27b-it",
                     "llama3.1:70b": "meta-llama/llama-3.1-70b-instruct",
                 }
                 or_model = (
@@ -1478,7 +1481,7 @@ def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
                     result = json.loads(response.read().decode("utf-8"))
                 result["backend_used"] = "openrouter"
                 return result
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
             if force_backend == "openrouter":
                 raise RuntimeError("OpenRouter backend failed") from exc
@@ -1526,7 +1529,7 @@ def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
                 "backend_used": "bedrock",
             }
             return result
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
             if force_backend == "bedrock":
                 raise RuntimeError("Bedrock backend failed") from exc
@@ -1550,7 +1553,7 @@ def post_model(payload: dict[str, Any], fast: bool = False) -> dict[str, Any]:
                 result = json.loads(response.read().decode("utf-8"))
             result["backend_used"] = "nim"
             return result
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
             if force_backend == "nim":
                 raise RuntimeError("NIM backend failed") from exc
@@ -1605,7 +1608,7 @@ def post_model_stream(payload: dict[str, Any], fast: bool = False):
         if content:
             yield content
         return
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         last_exc = exc
 
     raise RuntimeError("All streaming backends failed") from last_exc
@@ -1721,13 +1724,13 @@ def route_decision(incoming: dict[str, Any]) -> dict[str, Any]:
 
 
 def now_stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def write_trace(action: str, payload: dict[str, Any]) -> Path:
     TRACE_DIR.mkdir(parents=True, exist_ok=True)
     path = TRACE_DIR / "events.jsonl"
-    now = datetime.now(timezone.utc)  # single call: trace timestamp and file path stay consistent
+    now = datetime.now(UTC)  # single call: trace timestamp and file path stay consistent
     event = {"timestamp": now.isoformat(), "action": action, **payload}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
@@ -1772,7 +1775,7 @@ def update_project_memory(project_path: str | None, patch: dict[str, Any]) -> di
                 existing.append(value)
         else:
             memory[key] = value
-    memory["updated_at"] = datetime.now(timezone.utc).isoformat()
+    memory["updated_at"] = datetime.now(UTC).isoformat()
     path = project_memory_path(project_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(memory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -2149,8 +2152,8 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
         wrapper = (
             "import tracemalloc, runpy, sys\n"
             "tracemalloc.start()\n"
-            f"sys.argv = {repr(argv)}\n"
-            f"runpy.run_path({repr(script)}, run_name='__main__')\n"
+            f"sys.argv = {argv!r}\n"
+            f"runpy.run_path({script!r}, run_name='__main__')\n"
             "snap = tracemalloc.take_snapshot()\n"
             "top = snap.statistics('lineno')[:20]\n"
             "for s in top: print(s)\n"
@@ -2518,7 +2521,7 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
                 f"t = find_target('{query}');"
                 "assert t, 'window not found';"
                 f"send_string(t, '{text}');"
-                f"print(f'Sent to {{t.hwnd}} ({query}): {repr(text)}')"
+                f"print(f'Sent to {{t.hwnd}} ({query}): {text!r}')"
             )
         elif command == "sc_capture":
             query = (args or [""])[0].replace("'", "\\'")
@@ -2555,21 +2558,20 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
                 f"click_at(t.hwnd, {x}, {y});"
                 f"print(f'Clicked at ({x},{y}) in {{t.title}}')"
             )
-        else:  # sc_clipboard
-            if args and args[0] == "write":
-                text = (args[1] if len(args) > 1 else "").replace("'", "\\'")
-                snippet = (
-                    "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
-                    "from self_connect import write_clipboard;"
-                    f"write_clipboard('{text}');"
-                    "print('Clipboard written')"
-                )
-            else:
-                snippet = (
-                    "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
-                    "from self_connect import read_clipboard;"
-                    "print(read_clipboard() or '(empty)')"
-                )
+        elif args and args[0] == "write":
+            text = (args[1] if len(args) > 1 else "").replace("'", "\\'")
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import write_clipboard;"
+                f"write_clipboard('{text}');"
+                "print('Clipboard written')"
+            )
+        else:
+            snippet = (
+                "import sys; sys.path.insert(0, r'" + SC_SDK + r"');"
+                "from self_connect import read_clipboard;"
+                "print(read_clipboard() or '(empty)')"
+            )
 
         sc_result = subprocess.run(
             [sys.executable, "-c", snippet],
@@ -2582,20 +2584,37 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
                 "stdout": sc_result.stdout[-8000:], "stderr": sc_result.stderr[-2000:]}
 
     elif command == "spark_exec":
-        # SSH remote command execution on Spark-1 or Spark-2
-        # args[0] = node ("spark1" or "spark2"), args[1] = command to run
+        # SSH remote command execution on a configured node.
+        # args[0] = node key (e.g. "spark1"|"spark2"), args[1] = command to run.
+        # Targets are configured via env, never hardcoded:
+        #   LOCAL_CODER_SSH_<NODE>  e.g. LOCAL_CODER_SSH_SPARK1="user@10.0.0.1"
+        #   LOCAL_CODER_SSH_<NODE>_JUMP (optional) e.g. "user@jumphost" for -J
         if not args or len(args) < 2:
             return {"command": command, "returncode": 1,
-                    "stdout": "", "stderr": "spark_exec requires args[0]=node (spark1|spark2), args[1]=command"}
-        node = (args[0] or "spark1").lower()
+                    "stdout": "", "stderr": "spark_exec requires args[0]=node, args[1]=command"}
+        node = (args[0] or "spark1").strip().lower()
         remote_cmd = args[1]
-        if node in ("spark2", "spark-2"):
-            ssh_target = ["-J", "rblake2320@192.168.12.132", "rblake2320@10.0.0.2"]
-        else:
-            ssh_target = ["rblake2320@192.168.12.132"]
+        env_key = "LOCAL_CODER_SSH_" + re.sub(r"[^A-Z0-9]", "", node.upper())
+        ssh_host = os.environ.get(env_key, "")
+        if not ssh_host:
+            return {"command": command, "node": node, "returncode": 1, "stdout": "",
+                    "stderr": (f"no SSH target configured for node '{node}'. "
+                               f"Set {env_key}=user@host (and optionally {env_key}_JUMP=user@jumphost).")}
+        jump = os.environ.get(env_key + "_JUMP", "")
+        ssh_target = (["-J", jump, ssh_host] if jump else [ssh_host])
         ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
                    "-o", "BatchMode=yes"] + ssh_target + [remote_cmd]
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60, check=False)
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60, check=False)
+        except FileNotFoundError:
+            # No ssh client on PATH (e.g. Windows without the OpenSSH feature).
+            return {"command": command, "node": node, "returncode": 127, "stdout": "",
+                    "stderr": ("ssh client not found on PATH. On Windows: "
+                               "Settings > Apps > Optional Features > OpenSSH Client, "
+                               "or install Git for Windows and add its usr/bin to PATH.")}
+        except subprocess.TimeoutExpired:
+            return {"command": command, "node": node, "returncode": 124, "stdout": "",
+                    "stderr": f"ssh to {ssh_host} timed out after 60s"}
         write_trace("tool_run", {"command": command, "node": node, "remote_cmd": remote_cmd,
                                  "returncode": result.returncode})
         return {"command": command, "node": node, "remote_cmd": remote_cmd,
@@ -2607,11 +2626,13 @@ def run_safe_tool(command: str, args: list[str] | None = None, cwd: str | None =
         # args[0] = drive letter (optional, default all)
         drive = args[0] if args else None
         if drive:
+            # Normalize "C:", "C:\", or "C" down to just the letter "C".
+            drive_letter = drive.strip().rstrip("\\").rstrip(":").strip() or drive
             ps_cmd = (
                 f"Get-PhysicalDisk | Where-Object {{$_.DeviceId -like '*{drive}*'}} | "
                 "Select-Object FriendlyName,MediaType,HealthStatus,OperationalStatus,"
                 "Size,AllocatedSize | Format-List; "
-                f"$vol = Get-Volume -DriveLetter '{drive.rstrip(':').rstrip('\\\\')}';"
+                f"$vol = Get-Volume -DriveLetter '{drive_letter}';"
                 "$vol | Select-Object DriveLetter,HealthStatus,SizeRemaining,Size | Format-List"
             )
         else:
@@ -3437,7 +3458,7 @@ def decode_upload_content(item: dict[str, Any]) -> bytes:
             raise ValueError(
                 f"source_path must be inside the workspace ({WORKSPACE}). "
                 "Use content_base64 or content to upload external files."
-            )
+            ) from None
         if not source.exists() or not source.is_file():
             raise ValueError(f"source file missing: {source}")
         if source.stat().st_size > MAX_UPLOAD_BYTES:
@@ -3469,7 +3490,7 @@ def write_upload_file(item: dict[str, Any], upload_id: str | None = None) -> dic
         "bytes": len(data),
         "sha256": digest,
         "media_type": media_type,
-        "stored_at": datetime.now(timezone.utc).isoformat(),
+        "stored_at": datetime.now(UTC).isoformat(),
     }
     (root / "manifest.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     trace = write_trace("upload_file", record)
@@ -3489,7 +3510,7 @@ def upload_folder(incoming: dict[str, Any]) -> dict[str, Any]:
         "bytes": sum(int(item["bytes"]) for item in records),
         "root": str(upload_root(upload_id)),
         "files": [{key: item[key] for key in ("relative_path", "bytes", "sha256", "media_type")} for item in records],
-        "stored_at": datetime.now(timezone.utc).isoformat(),
+        "stored_at": datetime.now(UTC).isoformat(),
     }
     root = upload_root(upload_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -3928,7 +3949,7 @@ def enrich_messages(incoming: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "- **Terraform** – terraform_plan (returns install instructions if terraform is absent).\n"
         "- **IDE bridge** – the /chat API is OpenAI-compatible; connect any IDE plugin that supports custom endpoints.\n"
         "- **LoRA fine-tuning** – RTX 5090 + 128 GB RAM supports local fine-tuning workflows.\n"
-        "- **Remote Spark execution** – spark_exec tool runs any command on Spark-1 (192.168.12.132) or Spark-2 (10.0.0.2) via SSH (args: node=spark1|spark2, command).\n"
+        "- **Remote execution** – spark_exec tool runs any command on a configured SSH node via SSH (args: node, command). Targets come from LOCAL_CODER_SSH_<NODE> env vars; nothing is hardcoded.\n"
         "- **Disk health** – chkdsk_report tool checks Windows disk health via PowerShell Get-PhysicalDisk / Get-Volume (especially important: D: drive has 26k+ NTFS errors — use this to check before writing to D:).\n"
         "- **Load testing** – locust_run tool runs headless HTTP load tests (args: locustfile, users, spawn-rate, run-time).\n"
         "- **Tool discovery** – tool_search tool lists/filters all available tools by keyword.",
@@ -4851,7 +4872,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, docker_mcp_catalog())
             return
         if self.path.startswith("/instructions"):
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             proj = (qs.get("project_path") or [""])[0]
             global_path = Path.home() / ".localcoder" / "global.md"
@@ -4863,7 +4884,7 @@ class Handler(BaseHTTPRequestHandler):
                                   "project_path": str(proj_path) if proj_path else ""})
             return
         if self.path.startswith("/kb"):
-            from urllib.parse import urlparse, parse_qs
+            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             proj = (qs.get("project_path") or [""])[0]
             kb_dirs = [Path.home() / ".localcoder" / "kb"]
@@ -5441,7 +5462,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 {
-                    "id": f"local-coder-task-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}",
+                    "id": f"local-coder-task-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}",
                     "status": "completed",
                     "agent": PROVIDER_NAME,
                     "model": MODEL,
@@ -5466,7 +5487,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "empty content"})
                 return
             WORKSPACE.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             path = WORKSPACE / f"{stamp}_{title}.md"
             path.write_text(content + "\n", encoding="utf-8")
             self._send_json(200, {"path": str(path)})
